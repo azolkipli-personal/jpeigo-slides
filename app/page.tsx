@@ -7,12 +7,19 @@ import Gallery from '@/components/Gallery';
 
 interface ImageWithTranslation {
   url: string;
+  originalImageUrl?: string;
+  processedImageUrl?: string;
   name?: string;
   originalText?: string;
   translatedText?: string;
   detectedLanguage?: string;
   targetLanguage?: string;
   translating?: boolean;
+  textBlocks?: Array<{
+    text: string;
+    boundingBox: { x: number; y: number; width: number; height: number };
+    translatedText: string;
+  }>;
 }
 
 export default function Home() {
@@ -34,31 +41,36 @@ export default function Home() {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
 
-      const convertedImages: ImageWithTranslation[] = response.data.images.map((img: any) => ({
+      const convertedImages: ImageWithTranslation[] = response.data.images.map((img: ImageWithTranslation) => ({
         ...img,
+        originalImageUrl: img.url,
         translating: true
       }));
 
       setImages(convertedImages);
       setLoading(false);
 
-      // Step 2: Translate each image
+      // Step 2: Translate each image (with text replacement)
       for (let i = 0; i < convertedImages.length; i++) {
         try {
+          const base64Data = convertedImages[i].url.split(',')[1];
           const translationResponse = await axios.post('/api/translate', {
-            imageUrl: convertedImages[i].url
+            imageData: base64Data
           });
 
           setImages(prev => prev.map((img, index) =>
             index === i
               ? {
-                ...img,
-                originalText: translationResponse.data.originalText,
-                translatedText: translationResponse.data.translatedText,
-                detectedLanguage: translationResponse.data.detectedLanguage,
-                targetLanguage: translationResponse.data.targetLanguage,
-                translating: false
-              }
+                  ...img,
+                  originalText: translationResponse.data.originalText,
+                  translatedText: translationResponse.data.translatedText,
+                  detectedLanguage: translationResponse.data.detectedLanguage,
+                  targetLanguage: translationResponse.data.targetLanguage,
+                  originalImageUrl: translationResponse.data.originalImageUrl,
+                  processedImageUrl: translationResponse.data.imageUrl,
+                  textBlocks: translationResponse.data.textBlocks,
+                  translating: false
+                }
               : img
           ));
         } catch (translationError) {
@@ -69,10 +81,42 @@ export default function Home() {
         }
       }
 
-    } catch (err: any) {
+    } catch (err) {
       console.error(err);
-      setError('Failed to convert presentation. Please check your API key or file.');
+      setError('Failed to convert presentation. Please check your file.');
       setLoading(false);
+    }
+  };
+
+  const handleExportPPTX = async () => {
+    try {
+      const processedImages = images.filter(img => img.processedImageUrl);
+      if (processedImages.length === 0) {
+        setError('No processed images to export');
+        return;
+      }
+
+      const dominantLanguage = images[0]?.detectedLanguage || 'en';
+
+      const response = await axios.post('/api/export', {
+        images: processedImages,
+        language: dominantLanguage
+      }, {
+        responseType: 'blob'
+      });
+
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', 'translated-presentation.pptx');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+
+    } catch (err) {
+      console.error('Export failed:', err);
+      setError('Failed to export PPTX');
     }
   };
 
@@ -111,6 +155,38 @@ export default function Home() {
           }}>
             {error}
           </div>
+        )}
+
+        {images.length > 0 && images[0]?.processedImageUrl && (
+          <button
+            onClick={handleExportPPTX}
+            style={{
+              display: 'block',
+              width: '100%',
+              maxWidth: '400px',
+              margin: '24px auto 0',
+              padding: '16px 32px',
+              fontSize: '1.1rem',
+              fontWeight: 600,
+              color: '#fff',
+              background: 'linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%)',
+              border: 'none',
+              borderRadius: '12px',
+              cursor: 'pointer',
+              transition: 'transform 0.2s ease, box-shadow 0.2s ease',
+              boxShadow: '0 4px 14px 0 rgba(139, 92, 246, 0.39)'
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.transform = 'translateY(-2px)';
+              e.currentTarget.style.boxShadow = '0 6px 20px 0 rgba(139, 92, 246, 0.5)';
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.transform = 'translateY(0)';
+              e.currentTarget.style.boxShadow = '0 4px 14px 0 rgba(139, 92, 246, 0.39)';
+            }}
+          >
+            Download Translated PPTX
+          </button>
         )}
       </div>
 
