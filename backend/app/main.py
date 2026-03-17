@@ -1,0 +1,355 @@
+"""
+FastAPI endpoints for PPTX translation.
+"""
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from typing import Optional
+import uuid
+import os
+import asyncio
+from pathlib import Path
+import shutil
+
+from app.config import Settings, get_settings
+from app.core.extractor import extract_pptx
+from app.core.injector import inject_translations
+from app.translators.service import TranslationService
+from app.utils.cache import get_translation_memory
+from app.models import (
+    PPTXDocument,
+    TranslationRequest,
+    TranslationJob,
+    TranslatedRun,
+)
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="PPTX Translator API",
+    description="API for translating PowerPoint presentations while preserving formatting",
+    version="1.0.0",
+)
+
+# Load settings
+settings = get_settings()
+
+# Configure CORS for Next.js frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create directories
+Path(settings.upload_dir).mkdir(exist_ok=True)
+Path(settings.output_dir).mkdir(exist_ok=True)
+
+# Translation service
+translation_service = TranslationService(settings)
+
+# Translation memory
+tm = get_translation_memory()
+
+# In-memory job storage (use Redis in production)
+jobs: dict[str, TranslationJob] = {}
+
+
+class UploadResponse(BaseModel):
+    """Response after file upload."""
+    job_id: str
+    filename: str
+    total_slides: int
+    total_text_boxes: int
+    total_runs: int
+    slides: list[dict]
+
+
+class TranslateResponse(BaseModel):
+    """Response after translation."""
+    job_id: str
+    status: str
+    progress: float
+    total_runs: int
+    translated_runs: list[dict]
+
+
+class ExportResponse(BaseModel):
+    """Response for export."""
+    download_url: str
+
+
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {"status": "ok", "service": "PPTX Translator API"}
+
+
+@app.post("/api/upload", response_model=UploadResponse)
+async def upload_pptx(file: UploadFile = File(...)):
+    """
+    Upload a PPTX file and extract text runs.
+    
+    Returns structured data about all text in the presentation.
+    """
+    # Validate file type
+    if not file.filename or not file.filename.endswith('.pptx'):
+        raise HTTPException(status_code=400, detail="Only .pptx files are supported")
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Save uploaded file
+    file_path = Path(settings.upload_dir) / f"{job_id}_{file.filename}"
+    
+    try:
+        # Save file
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        if file_size > settings.max_file_size:
+            os.remove(file_path)
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size is {settings.max_file_size / (1024*1024):.0f}MB"
+            )
+        
+        # Extract text runs
+        document = extract_pptx(str(file_path), generate_preview=True)
+        
+        # Store job info
+        jobs[job_id] = TranslationJob(
+            job_id=job_id,
+            filename=file.filename,
+            status="uploaded",
+            total_runs=document.total_runs,
+            translated_runs=[],
+            progress=0.0,
+        )
+        
+        # Prepare response
+        slides_data = [
+            {
+                "slide_index": s.slide_index,
+                "slide_id": s.slide_id,
+                "text_boxes": [
+                    {
+                        "box_id": tb.box_id,
+                        "shape_type": tb.shape_type,
+                        "runs": [
+                            {
+                                "run_id": r.run_id,
+                                "text": r.text,
+                                "style": r.style.model_dump(),
+                            }
+                            for r in tb.runs
+                        ],
+                        "constraints": tb.constraints.model_dump(),
+                    }
+                    for tb in s.text_boxes
+                ],
+            }
+            for s in document.slides
+        ]
+        
+        return UploadResponse(
+            job_id=job_id,
+            filename=file.filename,
+            total_slides=len(document.slides),
+            total_text_boxes=sum(len(s.text_boxes) for s in document.slides),
+            total_runs=document.total_runs,
+            slides=slides_data,
+        )
+        
+    except Exception as e:
+        # Clean up on error
+        if file_path.exists():
+            os.remove(file_path)
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+
+@app.post("/api/translate", response_model=TranslateResponse)
+async def translate_pptx(request: TranslationRequest, background_tasks: BackgroundTasks):
+    """
+    Translate text runs in a PPTX file.
+    
+    The translation is processed in the background for large files.
+    """
+    job_id = str(uuid.uuid4())
+    
+    # Initialize job
+    jobs[job_id] = TranslationJob(
+        job_id=job_id,
+        filename="",
+        status="processing",
+        total_runs=len(request.runs),
+        translated_runs=[],
+        progress=0.0,
+    )
+    
+    # Process translations
+    translated_runs = []
+    tm = get_translation_memory()
+    
+    # Build context from translation memory
+    context = tm.build_context_prompt(request.source_language, request.target_language)
+    
+    for i, run in enumerate(request.runs):
+        # Check cache first
+        cached = tm.get(run.text, request.source_language, request.target_language)
+        
+        if cached:
+            translated_text = cached
+            model_used = "cache"
+            success = True
+        else:
+            # Translate
+            translated_text, model_used, success = await translation_service.translate_text(
+                text=run.text,
+                source_lang=request.source_language,
+                target_lang=request.target_language,
+                model=request.model,
+                context=context,
+            )
+            
+            # Cache the translation
+            if success:
+                tm.set(
+                    text=run.text,
+                    translated_text=translated_text,
+                    source_lang=request.source_language,
+                    target_lang=request.target_language,
+                    model_used=model_used,
+                )
+        
+        # Create translated run
+        translated_run = TranslatedRun(
+            run_id=run.run_id,
+            original_text=run.text,
+            translated_text=translated_text,
+            source_language=request.source_language,
+            target_language=request.target_language,
+            model_used=model_used,
+        )
+        
+        translated_runs.append(translated_run)
+        
+        # Update progress
+        jobs[job_id].translated_runs.append(translated_run)
+        jobs[job_id].progress = (i + 1) / len(request.runs) * 100
+    
+    # Mark job as completed
+    jobs[job_id].status = "completed"
+    jobs[job_id].progress = 100.0
+    
+    return TranslateResponse(
+        job_id=job_id,
+        status="completed",
+        progress=100.0,
+        total_runs=len(request.runs),
+        translated_runs=[tr.model_dump() for tr in translated_runs],
+    )
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Get job status."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return jobs[job_id]
+
+
+@app.post("/api/export")
+async def export_pptx(request: ExportResponse):
+    """
+    Export translated PPTX file.
+    
+    Takes the job ID and returns the translated file.
+    """
+    job_id = request.job_id
+    
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail="Job not completed")
+    
+    # Find uploaded file
+    upload_dir = Path(settings.upload_dir)
+    input_files = list(upload_dir.glob(f"{job_id}_*.pptx"))
+    
+    ifnot input_files:
+        raise HTTPException(status_code=404, detail="Original file not found")
+    
+    input_path = input_files[0]
+    output_filename = request.filename or f"translated_{job.filename}"
+    output_path = Path(settings.output_dir) / output_filename
+    
+    try:
+        # Inject translations
+        success, failed = inject_translations(
+            str(input_path),
+            str(output_path),
+            job.translated_runs,
+            None,  # Original document not needed for injection
+        )
+        
+        if not success:
+            # Log failed runs
+            for run in failed:
+                print(f"Failed to inject: {run.run_id}")
+        
+        # Return file
+        return FileResponse(
+            path=str(output_path),
+            filename=output_filename,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error exporting file: {str(e)}")
+
+
+@app.get("/api/cache")
+async def get_translation_cache():
+    """Get cached translations."""
+    tm = get_translation_memory()
+    return tm.export()
+
+
+@app.delete("/api/cache")
+async def clear_translation_cache():
+    """Clear translation memory."""
+    tm = get_translation_memory()
+    tm.clear()
+    return {"status": "cleared"}
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "version": "1.0.0",
+        "settings": {
+            "glm_configured": bool(settings.glm_api_key),
+            "kimi_configured": bool(settings.kimi_api_key),
+            "minimax_configured": bool(settings.minimax_api_key),
+            "qwen_configured": bool(settings.qwen_api_key),
+            "ollama_configured": bool(settings.ollama_url),
+        },
+    }
+
+
+# Run with: uvicorn app.main:app --reload --port 8000
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
