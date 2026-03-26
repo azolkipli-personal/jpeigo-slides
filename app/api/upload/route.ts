@@ -1,6 +1,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { writeFile, unlink, mkdir, readdir, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { exec } from 'child_process';

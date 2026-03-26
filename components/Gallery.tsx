@@ -13,10 +13,12 @@ interface GalleryProps {
         detectedLanguage?: string;
         targetLanguage?: string;
         translating?: boolean;
+        error?: string;
     }[];
+    onRetry?: (index: number) => void;
 }
 
-const Gallery: React.FC<GalleryProps> = ({ images }) => {
+const Gallery: React.FC<GalleryProps> = ({ images, onRetry }) => {
     const [showProcessed, setShowProcessed] = useState<{ [key: number]: boolean }>({});
 
     if (images.length === 0) return null;
@@ -132,6 +134,39 @@ const Gallery: React.FC<GalleryProps> = ({ images }) => {
                                     textAlign: 'center'
                                 }}>
                                     No text detected
+                                </div>
+                            )}
+
+                            {img.error && (
+                                <div style={{
+                                    marginTop: '12px',
+                                    padding: '12px',
+                                    background: 'rgba(239, 68, 68, 0.1)',
+                                    border: '1px solid rgba(239, 68, 68, 0.2)',
+                                    borderRadius: '8px',
+                                    fontSize: '0.75rem',
+                                    color: '#fca5a5',
+                                    textAlign: 'center'
+                                }}>
+                                    <div style={{ marginBottom: '8px' }}>{img.error}</div>
+                                    {onRetry && (
+                                        <button
+                                            onClick={() => onRetry(index)}
+                                            style={{
+                                                padding: '6px 12px',
+                                                fontSize: '0.75rem',
+                                                fontWeight: 500,
+                                                color: '#fff',
+                                                background: 'rgba(239, 68, 68, 0.3)',
+                                                border: '1px solid rgba(239, 68, 68, 0.4)',
+                                                borderRadius: '4px',
+                                                cursor: 'pointer',
+                                                transition: 'all 0.2s ease'
+                                            }}
+                                        >
+                                            Retry
+                                        </button>
+                                    )}
                                 </div>
                             )}
                         </div>

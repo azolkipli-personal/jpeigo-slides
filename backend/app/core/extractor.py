@@ -3,8 +3,7 @@ Core PPTX extraction logic.
 Extracts text runs while preserving XML styling attributes.
 """
 from pptx import Presentation
-from pptx.shapes.shapes import Shape
-from pptx.shapes.autoshape import AutoShape
+from pptx.shapes.base import BaseShape as Shape
 from pptx.shapes.group import GroupShape
 from pptx.shapes.graphfrm import GraphicFrame
 from pptx.table import Table
@@ -98,7 +97,7 @@ def extract_style_from_run(run) -> FontStyle:
         bold=run.font.bold if run.font.bold else False,
         italic=run.font.italic if run.font.italic else False,
         underline=bool(run.font.underline) if run.font.underline else False,
-        strike_through=run.font.strike if run.font.strike else False,
+        strike_through=False,  # Not available in python-pptx
     )
     
     # Check for vertical text (tategaki)

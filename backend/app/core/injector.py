@@ -3,7 +3,7 @@ Core PPTX re-injection logic.
 Re-inserts translated text while preserving original styling.
 """
 from pptx import Presentation
-from pptx.shapes.shapes import Shape
+from pptx.shapes.base import BaseShape as Shape
 from pptx.shapes.group import GroupShape
 from pptx.shapes.graphfrm import GraphicFrame
 from pptx.text.text import TextFrame
