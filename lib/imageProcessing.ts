@@ -59,10 +59,13 @@ export async function removeTextWithFill(imagePath: string, boundingBoxes: Bound
 
         for (let y = box.y; y < box.y + box.height; y++) {
             for (let x = box.x; x < box.x + box.width; x++) {
-                const i = (y * info.width + x) * 3;
-                data[i] = avgR;
-                data[i + 1] = avgG;
-                data[i + 2] = avgB;
+                // Check bounds before accessing array
+                if (x >= 0 && x < info.width && y >= 0 && y < info.height) {
+                    const i = (y * info.width + x) * 3;
+                    data[i] = avgR;
+                    data[i + 1] = avgG;
+                    data[i + 2] = avgB;
+                }
             }
         }
     }
@@ -75,52 +78,63 @@ export async function overlayText(
     textBlocks: TextBlockWithTranslation[],
     targetLanguage: string
 ): Promise<Buffer> {
-    const image = await loadImage(imageBuffer);
-    const canvas = createCanvas(image.width, image.height);
-    const ctx = canvas.getContext('2d');
-
-    ctx.drawImage(image, 0, 0);
-
-    const isJapanese = targetLanguage === 'ja';
-
-    for (const block of textBlocks) {
-        const { text, boundingBox } = block;
-        const displayText = block.translatedText || text;
-
-        const fontSize = Math.floor(Math.min(boundingBox.height, 72));
-        const fontFamily = isJapanese
-            ? '"MS Gothic", "Hiragino Kaku Gothic Pro", "Noto Sans JP", sans-serif'
-            : '"Arial", "Noto Sans", sans-serif';
-
-        ctx.font = `${fontSize}px ${fontFamily}`;
-        ctx.fillStyle = '#000000';
-        ctx.textBaseline = 'top';
-
-        const words = displayText.split(' ');
-        let line = '';
-        let y = boundingBox.y;
-        const lineHeight = fontSize * 1.2;
-
-        if (isJapanese) {
-            ctx.fillText(displayText, boundingBox.x, y);
-        } else {
-            for (const word of words) {
-                const testLine = line + word + ' ';
-                const metrics = ctx.measureText(testLine);
-
-                if (metrics.width > boundingBox.width && line !== '') {
-                    ctx.fillText(line, boundingBox.x, y);
-                    line = word + ' ';
-                    y += lineHeight;
-                } else {
-                    line = testLine;
-                }
-            }
-            ctx.fillText(line, boundingBox.x, y);
-        }
+    // Validate that we have a valid image buffer
+    if (!imageBuffer || imageBuffer.length === 0) {
+        throw new Error('Invalid image buffer');
     }
+    
+    try {
+        const image = await loadImage(imageBuffer);
+        const canvas = createCanvas(image.width, image.height);
+        const ctx = canvas.getContext('2d');
 
-    return canvas.toBuffer('image/jpeg');
+        ctx.drawImage(image, 0, 0);
+        
+        const isJapanese = targetLanguage === 'ja';
+        
+        for (const block of textBlocks) {
+            const { text, boundingBox } = block;
+            const displayText = block.translatedText || text;
+        
+            const fontSize = Math.floor(Math.min(boundingBox.height, 72));
+            const fontFamily = isJapanese
+                ? '"MS Gothic", "Hiragino Kaku Gothic Pro", "Noto Sans JP", sans-serif'
+                : '"Arial", "Noto Sans", sans-serif';
+        
+            ctx.font = `${fontSize}px ${fontFamily}`;
+            ctx.fillStyle = '#000000';
+            ctx.textBaseline = 'top';
+        
+            const words = displayText.split(' ');
+            let line = '';
+            let y = boundingBox.y;
+            const lineHeight = fontSize * 1.2;
+        
+            if (isJapanese) {
+                ctx.fillText(displayText, boundingBox.x, y);
+            } else {
+                for (const word of words) {
+                    const testLine = line + word + ' ';
+                    const metrics = ctx.measureText(testLine);
+        
+                    if (metrics.width > boundingBox.width && line !== '') {
+                        ctx.fillText(line, boundingBox.x, y);
+                        line = word + ' ';
+                        y += lineHeight;
+                    } else {
+                        line = testLine;
+                    }
+                }
+                ctx.fillText(line, boundingBox.x, y);
+            }
+        }
+        
+        return canvas.toBuffer('image/jpeg');
+    } catch (error) {
+        console.error('[OVERLAYTEXT] Error in overlayText:', error);
+        // Return the original image buffer if processing fails
+        return imageBuffer;
+    }
 }
 
 export function getLanguage(text: string): string {

@@ -286,7 +286,7 @@ async def export_pptx(request: ExportResponse):
     upload_dir = Path(settings.upload_dir)
     input_files = list(upload_dir.glob(f"{job_id}_*.pptx"))
     
-    ifnot input_files:
+    if not input_files:
         raise HTTPException(status_code=404, detail="Original file not found")
     
     input_path = input_files[0]

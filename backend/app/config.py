@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     qwen_api_key: Optional[str] = None
     qwen_api_url: str = "https://dashscope.aliyuncs.com/api/v1"
     
+    # Google Cloud API settings (for Vision OCR and Translation)
+    google_cloud_api_key: Optional[str] = None
+    
     # Google Gemini settings (free tier available)
     gemini_api_key: Optional[str] = None
     gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta"

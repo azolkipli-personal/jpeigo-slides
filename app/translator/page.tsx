@@ -53,7 +53,7 @@ interface TranslatedRun {
 }
 
 export default function NewTranslatorPage() {
-  const [document, setDocument] = useState<UploadedDocument | null>(null);
+  const [uploadedDoc, setUploadedDoc] = useState<UploadedDocument | null>(null);
   const [translatedRuns, setTranslatedRuns] = useState<TranslatedRun[]>([]);
   const [loading, setLoading] = useState(false);
   const [translating, setTranslating] = useState(false);
@@ -91,7 +91,7 @@ export default function NewTranslatorPage() {
       }
 
       const data = await response.json();
-      setDocument(data);
+      setUploadedDoc(data);
       setProgress(100);
 
     } catch (err) {
@@ -103,7 +103,7 @@ export default function NewTranslatorPage() {
   }, []);
 
   const handleTranslate = useCallback(async () => {
-    if (!document) return;
+    if (!uploadedDoc) return;
 
     setTranslating(true);
     setError(null);
@@ -112,7 +112,7 @@ export default function NewTranslatorPage() {
     try {
       // Flatten all runs from all slides
       const allRuns: TextRun[] = [];
-      for (const slide of document.slides) {
+      for (const slide of uploadedDoc.slides) {
         for (const textBox of slide.text_boxes) {
           allRuns.push(...textBox.runs);
         }
@@ -146,10 +146,10 @@ export default function NewTranslatorPage() {
     } finally {
       setTranslating(false);
     }
-  }, [document, sourceLang, targetLang, model]);
+  }, [uploadedDoc, sourceLang, targetLang, model]);
 
   const handleExport = useCallback(async () => {
-    if (!document || translatedRuns.length === 0) return;
+    if (!uploadedDoc || translatedRuns.length === 0) return;
 
     setExporting(true);
     setError(null);
@@ -161,8 +161,8 @@ export default function NewTranslatorPage() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          job_id: document.job_id,
-          filename: `translated_${document.filename}`,
+          job_id: uploadedDoc.job_id,
+          filename: `translated_${uploadedDoc.filename}`,
         }),
       });
 
@@ -174,12 +174,12 @@ export default function NewTranslatorPage() {
       // Download the file
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `translated_${document.filename}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      const link = window.document.createElement('a');
+      link.href = url;
+      link.download = `translated_${uploadedDoc.filename}`;
+      window.document.body.appendChild(link);
+      link.click();
+      window.document.body.removeChild(link);
       window.URL.revokeObjectURL(url);
 
     } catch (err) {
@@ -188,7 +188,7 @@ export default function NewTranslatorPage() {
     } finally {
       setExporting(false);
     }
-  }, [document, translatedRuns]);
+  }, [uploadedDoc, translatedRuns]);
 
   // Manual edit handler
   const handleTextEdit = useCallback((runId: string, newText: string) => {
@@ -216,13 +216,13 @@ export default function NewTranslatorPage() {
       {/* Main Content */}
       <div className="max-w-7xl mx-auto px-4 pb-12">
         {/* Upload Section */}
-        {!document && (
+        {!uploadedDoc && (
           <div className="bg-gray-800/50 rounded-2xl p-8 border border-purple-500/20">
             <h2 className="text-xl font-semibold mb-4">Upload PowerPoint</h2>
             <div
               className="border-2 border-dashed border-purple-500/50 rounded-xl p-12 text-center cursor-pointer hover:border-purple-400 transition-colors"
               onClick={() => {
-                const input = document.createElement('input');
+                const input = window.document.createElement('input');
                 input.type = 'file';
                 input.accept = '.pptx';
                 input.onchange = (e) => {
@@ -256,22 +256,22 @@ export default function NewTranslatorPage() {
         )}
 
         {/* Document Info and Translation Settings */}
-        {document && (
+        {uploadedDoc && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
             {/* Document Info */}
             <div className="lg:col-span-2 bg-gray-800/50 rounded-2xl p-6 border border-purple-500/20">
-              <h2 className="text-xl font-semibold mb-4">{document.filename}</h2>
+              <h2 className="text-xl font-semibold mb-4">{uploadedDoc.filename}</h2>
               <div className="grid grid-cols-3 gap-4 text-center">
                 <div className="bg-gray-700/50 rounded-xl p-4">
-                  <div className="text-3xl font-bold text-purple-400">{document.total_slides}</div>
+                  <div className="text-3xl font-bold text-purple-400">{uploadedDoc.total_slides}</div>
                   <div className="text-gray-400 text-sm">Slides</div>
                 </div>
                 <div className="bg-gray-700/50 rounded-xl p-4">
-                  <div className="text-3xl font-bold text-blue-400">{document.total_text_boxes}</div>
+                  <div className="text-3xl font-bold text-blue-400">{uploadedDoc.total_text_boxes}</div>
                   <div className="text-gray-400 text-sm">Text Boxes</div>
                 </div>
                 <div className="bg-gray-700/50 rounded-xl p-4">
-                  <div className="text-3xl font-bold text-green-400">{document.total_runs}</div>
+                  <div className="text-3xl font-bold text-green-400">{uploadedDoc.total_runs}</div>
                   <div className="text-gray-400 text-sm">Text Runs</div>
                 </div>
               </div>
@@ -368,7 +368,7 @@ export default function NewTranslatorPage() {
         )}
 
         {/* Preview and Review Section */}
-        {document && translatedRuns.length > 0 && (
+        {uploadedDoc && translatedRuns.length > 0 && (
           <div className="mt-6 bg-gray-800/50 rounded-2xl p-6 border border-purple-500/20">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-semibold">Review Translations</h2>
@@ -387,7 +387,7 @@ export default function NewTranslatorPage() {
 
             {/* Slide-by-slide review */}
             <div className="space-y-6 max-h-[600px] overflow-y-auto">
-              {document.slides.map((slide, slideIdx) => (
+              {uploadedDoc.slides.map((slide, slideIdx) => (
                 <div key={slide.slide_index} className="border border-gray-700 rounded-xl p-4">
                   <h3 className="text-lg font-medium text-purple-400 mb-3">
                     Slide {slideIdx + 1}

@@ -444,6 +444,49 @@ Translation:"""
         return "ollama"
 
 
+class GoogleCloudTranslator(TranslatorInterface):
+    """Google Cloud Translation API (fast, reliable, no context awareness)."""
+    
+    def __init__(self, settings: Settings):
+        self.api_key = settings.google_cloud_api_key
+    
+    async def translate(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        context: Optional[str] = None,
+    ) -> tuple[str, bool]:
+        if not self.api_key:
+            return text, False
+        
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    "https://translation.googleapis.com/language/translate/v2",
+                    params={"key": self.api_key},
+                    json={
+                        "q": [text],
+                        "target": target_lang,
+                        "format": "text",
+                    },
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    translations = data.get("data", {}).get("translations", [])
+                    if translations:
+                        translated = translations[0].get("translatedText", text)
+                        return translated, True
+                return text, False
+        except Exception as e:
+            print(f"Google Cloud translation error: {e}")
+            return text, False
+    
+    def get_model_name(self) -> str:
+        return "google-cloud"
+
+
 class TranslationService:
     """
     Translation service that routes to appropriate translator.
@@ -468,6 +511,9 @@ class TranslationService:
         """Get the appropriate translator for a model."""
         if model == 'auto':
             # Auto-select based on availability (priority: free/cheap first)
+            # Google Cloud is fastest and most reliable
+            if self.settings.google_cloud_api_key:
+                return self.translators['google-cloud']
             if self.settings.gemini_api_key:
                 return self.translators['gemini']
             if self.settings.opencode_api_key:
@@ -482,8 +528,8 @@ class TranslationService:
                 return self.translators['minimax']
             if self.settings.ollama_url:
                 return self.translators['ollama']
-            # Default to Gemini structure even without key (will fail gracefully)
-            return self.translators['gemini']
+            # Default to Google Cloud even without key (will fail gracefully)
+            return self.translators['google-cloud']
         
         # Handle opencode sub-models
         if model.startswith('opencode-'):

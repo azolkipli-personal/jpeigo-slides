@@ -225,7 +225,7 @@ def extract_from_shape(
     # Handle group shapes recursively
     if isinstance(shape, GroupShape):
         for sub_idx, sub_shape in enumerate(shape.shapes):
-            text_boxes.extend(extract_from_shape(sub_shape, slide_idx, f"{shape_idx}_{sub_idx}"))
+            text_boxes.extend(extract_from_shape(sub_shape, slide_idx, shape_idx))
         return text_boxes
     
     # Handle graphic frames (charts, diagrams, tables)
@@ -235,19 +235,21 @@ def extract_from_shape(
             for row_idx, row in enumerate(table.rows):
                 for col_idx, cell in enumerate(row.cells):
                     if cell.text_frame:
+                        # Keep shape_idx as int, use compound ID for uniqueness
+                        table_id = f"{shape_idx}_table_{row_idx}_{col_idx}"
                         runs = extract_runs_from_text_frame(
                             cell.text_frame,
                             slide_idx,
-                            f"{shape_idx}_table_{row_idx}_{col_idx}",
+                            shape_idx,  # Keep as integer
                             "table_cell",
                         )
                         if runs:
                             constraints = get_spatial_constraints(shape)
                             text_boxes.append(TextBox(
-                                box_id=f"box_{slide_idx}_{shape_idx}_table_{row_idx}_{col_idx}",
+                                box_id=f"box_{slide_idx}_{table_id}",
                                 shape_type="table_cell",
                                 slide_index=slide_idx,
-                                shape_index=shape_idx,
+                                shape_index=shape_idx,  # Keep as integer
                                 runs=runs,
                                 constraints=constraints,
                             ))
