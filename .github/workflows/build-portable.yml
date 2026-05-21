@@ -48,7 +48,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pyinstaller
-          pip install python-pptx fastapi uvicorn pydantic pydantic-settings lxml httpx
+          pip install python-pptx fastapi uvicorn pydantic pydantic-settings lxml httpx python-multipart
         shell: pwsh
 
       - name: Build executable with PyInstaller
@@ -64,8 +64,24 @@ jobs:
             --hidden-import "uvicorn.protocols.http.auto" ^
             --hidden-import "uvicorn.protocols.websocket.auto" ^
             --hidden-import "lxml._elementpath" ^
-            --collect-submodules "pptx" ^
-            --collect-submodules "lxml" ^
+            --hidden-import "fastapi" ^
+            --hidden-import "starlette" ^
+            --hidden-import "pydantic" ^
+            --hidden-import "pydantic_settings" ^
+            --hidden-import "httpx" ^
+            --hidden-import "anyio" ^
+            --hidden-import "sniffio" ^
+            --hidden-import "h11" ^
+            --hidden-import "httpcore" ^
+            --hidden-import "multipart" ^
+            --collect-all "fastapi" ^
+            --collect-all "starlette" ^
+            --collect-all "uvicorn" ^
+            --collect-all "pptx" ^
+            --collect-all "lxml" ^
+            --collect-all "pydantic" ^
+            --collect-all "httpx" ^
+            --collect-all "anyio" ^
             --add-data ".env.example;." ^
             --add-data "app/templates/setup.html;app/templates" ^
             app/run.py
