@@ -1,61 +1,264 @@
-# PPTX Translator
+# jpeigo-slides | PPTX Translator
 
-## Why
+> **XML-level PowerPoint translation** — translate `.pptx` files while preserving every pixel of formatting. Built for Japanese ↔ English localisation.
 
-Translating PowerPoint presentations is genuinely painful. The standard approach — export to images, run OCR, translate text, paste back — destroys your formatting. Font sizes break. Colors shift. Text boxes overflow. Vertical Japanese text (tategaki) gets mangled. If you're localising a corporate deck with 50+ slides, every round of manual fixes costs hours. And the result still looks off. This problem hits anyone who works across Japanese and English in a business context: sales teams, marketing, product managers, consultants.
+Translate corporate decks, proposals, and presentations without the usual reformatting nightmare. No OCR. No image hacks. No broken layouts.
 
-## What
+---
 
-PPTX Translator translates PowerPoint files while preserving formatting — font sizes, colors, bold/italic/underline, text box positions, and even vertical Japanese text. It works at the XML level inside the `.pptx` file, extracting and re-injecting translated text runs without touching the layout. No OCR hacks, no image-based workarounds, no reformatting hell.
+## Why This Exists
 
-The impact: what used to take hours per deck now takes minutes. Upload → review → export. The translated PPTX comes out looking like the original, just in a different language.
+Translating PowerPoint presentations is genuinely painful. The standard approach — export to images, run OCR, translate, paste back — destroys your formatting. Font sizes break. Colors shift. Text boxes overflow. Japanese vertical text (tategaki) gets mangled. If you're localising a corporate deck with 50+ slides, every round of manual fixes costs hours.
+
+**jpeigo-slides** works at the XML level inside the `.pptx` file, extracting text runs and re-injecting translated text without touching the layout. The result: a translated file that looks like the original, just in a different language.
+
+---
 
 ## Features
 
-- **XML-level text extraction** — Reads text runs directly from the PPTX structure using python-pptx
+- **XML-level text extraction** — Reads text runs directly from the PPTX structure via `python-pptx`
 - **Full formatting preservation** — Font size, color, typeface, bold, italic, underline, text box positioning
-- **Vertical text support** — Handles Japanese tategaki (縦書き) correctly
-- **Spatial awareness** — Auto-adjusts font size when translated text overflows the text box
-- **Mixed-language content** — Preserves mixed Japanese-English within the same text box
-- **Translation memory** — Caches translations for consistency across slides and files
-- **Review interface** — Preview and edit translations before export
-- **Multi-provider** — Works with Qwen, Kimi, GLM, MiniMax, or local Ollama models
+- **SmartArt / Diagram support** — Extracts and injects text from SmartArt diagrams (slides with `<dgm:pt>` elements)
+- **Table support** — Handles text within table cells
+- **Grouped shapes** — Recursive traversal of nested shape groups
+- **Vertical Japanese text** — Correctly handles tategaki (縦書き)
+- **Spatial awareness** — Auto-adjusts font size when translated text overflows its text box
+- **Translation memory** — Caches translations for consistency across slides and sessions
+- **Review interface** — Preview and edit translations before downloading
+- **Preview images** — Renders translated slides as PNG via LibreOffice + pdftoppm (with disk caching)
+- **Multi-provider** — Gemini, OpenCode (DeepSeek / Kimi / Qwen / MiniMax), Google Cloud, GLM, Kimi, MiniMax, Qwen, Ollama
 
-## Quick Start
+---
 
-### Prerequisites
-- Node.js 18+
-- Python 3.11+
-- API key for at least one translation service (Qwen has a free tier)
+## Architecture
 
-### Start Backend
+```
+┌──────────────────┐     ┌───────────────────┐
+│  Next.js Frontend │────▶│  Python FastAPI    │
+│  (port 3002)      │◀────│  Backend (port 8002)│
+│                   │     │                    │
+│  - Upload UI      │     │  - PPTX extraction │
+│  - Translation UI │     │  - PPTX injection  │
+│  - Slide preview  │     │  - Translation API │
+│  - Edit/Export    │     │  - Translation mem  │
+└──────────────────┘     └───────────────────┘
+```
+
+The Next.js frontend proxies API calls to the Python backend. The backend does all the heavy lifting — parsing the `.pptx` ZIP structure, extracting XML text runs, calling translation APIs, and re-injecting translated text into the XML.
+
+---
+
+## Prerequisites
+
+- **Node.js** 18+
+- **Python** 3.10+
+- **LibreOffice** (for slide preview images) — `soffice` must be on PATH
+- **pdftoppm** (part of `poppler-utils`) — for PDF → PNG conversion
+- At least one **API key** for a translation provider
+
+---
+
+## Installation
+
+### 1. Clone & Install Frontend
+
+```bash
+git clone https://github.com/azolkipli-personal/jpeigo-slides.git
+cd jpeigo-slides
+npm install
+```
+
+### 2. Set Up Python Backend
+
 ```bash
 cd backend
-chmod +x start.sh && ./start.sh   # Linux/Mac
-# Or: start.bat                     # Windows
+python3 -m venv venv
+source venv/bin/activate   # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### Configure API Keys
-Edit `backend/.env` and add your keys:
-```env
-QWEN_API_KEY=your_key_here
-```
+If `requirements.txt` doesn't exist, install dependencies manually:
 
-### Start Frontend
 ```bash
-npm install
+pip install "python-pptx>=1.0.2" "fastapi>=0.115.0" "uvicorn[standard]>=0.34.0" \
+    "pydantic>=2.0.0" "pydantic-settings>=2.0.0" "lxml>=5.3.0" "httpx>=0.28.0"
+```
+
+### 3. Configure API Keys
+
+Copy the example env file and add your keys:
+
+```bash
+cp .env.example .env
+# Edit .env with your API keys
+```
+
+See [Configuration](#configuration) below for all available options.
+
+### 4. Start the Backend
+
+```bash
+cd backend
+source venv/bin/activate
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8002
+```
+
+Or use the convenience script:
+```bash
+chmod +x start.sh && ./start.sh
+```
+
+### 5. Start the Frontend
+
+```bash
+# From the project root
 npm run dev
 ```
 
-Open http://localhost:3000/translator
+Open **http://localhost:3002/translator** in your browser.
 
-## Tech Stack
+---
 
-- **Frontend**: Next.js 16, React 19, Tailwind CSS
-- **Backend**: Python FastAPI, python-pptx
-- **Translation**: Qwen, Kimi (Moonshot), GLM-4 (Zhipu), MiniMax, Ollama (local)
-- **OCR** (legacy mode): Google Cloud Vision, Tesseract.js
-- **Export**: pptxgenjs, Canvas API
+## Configuration
+
+All configuration is done via environment variables in `backend/.env`.
+
+### Translation Providers (at least one required)
+
+| Variable | Description | Example |
+|---|---|---|
+| `GEMINI_API_KEY` | Google Gemini API key (free tier available) | `AIza...` |
+| `OPENCODE_API_KEY` | OpenCode API key (unified access to curated models) | `sk-...` |
+| `GOOGLE_CLOUD_API_KEY` | Google Cloud Translation API key | `AIza...` |
+| `GLM_API_KEY` | GLM-4 (BigModel) API key | — |
+| `KIMI_API_KEY` | Kimi / Moonshot API key | — |
+| `MINIMAX_API_KEY` | MiniMax API key (also needs `MINIMAX_GROUP_ID`) | — |
+| `QWEN_API_KEY` | Qwen (DashScope) API key | — |
+| `OLLAMA_URL` | Local Ollama URL for offline translation | `http://localhost:11434` |
+
+### Server Settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `CORS_ORIGINS` | `["http://localhost:3002"]` | Allowed CORS origins |
+| `DEFAULT_MODEL` | `gemini` | Default translation model |
+| `DEBUG` | `false` | Enable debug mode |
+
+### Advanced
+
+| Variable | Default | Description |
+|---|---|---|
+| `PYTHON_BACKEND_URL` (frontend `.env.local`) | `http://localhost:8002` | Backend URL for the Next.js proxy |
+| `GEMINI_API_URL` | `https://generativelanguage.googleapis.com/v1beta` | Gemini API endpoint |
+| `OPENCODE_API_URL` | `https://api.opencode.ai/v1` | OpenCode API endpoint |
+
+---
+
+## Usage
+
+1. **Upload** — Drag & drop a `.pptx` file (up to 50MB)
+2. **Configure** — Select source/target language (English ↔ Japanese) and translation model
+3. **Translate** — Click Translate — all text is processed with concurrent API calls
+4. **Review** — Browse slides via preview images, edit any translation inline
+5. **Export** — Download the translated `.pptx` — all formatting preserved
+
+### Supported Models
+
+**Gemini (Google):**
+- `gemini-pro` — Gemini 3 Pro
+- `gemini-flash` — Gemini 3.5 Flash
+- `gemini-flash-lite` — Gemini 3.1 Flash Lite (fast, free tier)
+- `gemini-25-flash-lite` — Gemini 2.5 Flash Lite
+
+**OpenCode (unified API):**
+- `opencode-deepseek` — DeepSeek V4
+- `opencode-kimi` — Kimi K2.5
+- `opencode-qwen` — Qwen Max
+- `opencode-minimax` — MiniMax M2.5
+
+**Direct APIs:**
+- `glm`, `kimi`, `minimax`, `qwen`, `ollama`, `google-cloud`
+
+---
+
+## Project Structure
+
+```
+jpeigo-slides/
+├── app/                    # Next.js frontend
+│   ├── api/                # API route handlers (proxies to backend)
+│   │   ├── upload-new/     # File upload endpoint
+│   │   ├── translate-new/  # Translation endpoint
+│   │   ├── export-new/     # Download endpoint
+│   │   ├── preview/        # Slide preview images
+│   │   └── health/         # Health check
+│   └── translator/         # Main translator UI page
+├── backend/
+│   └── app/
+│       ├── core/
+│       │   ├── extractor.py   # PPTX text extraction (shapes, tables, SmartArt)
+│       │   └── injector.py    # Text re-injection into PPTX XML
+│       ├── translators/
+│       │   └── service.py     # Translation providers (Gemini, OpenCode, etc.)
+│       ├── utils/
+│       │   └── cache.py       # Translation memory
+│       ├── models/            # Pydantic data models
+│       ├── config.py          # Environment variable configuration
+│       └── main.py            # FastAPI application & endpoints
+├── components/             # Shared React components
+└── package.json
+```
+
+---
+
+## How It Works
+
+### Extraction
+
+1. Opens the `.pptx` as a ZIP and reads each slide's XML
+2. Iterates shapes: text boxes, grouped shapes, tables, SmartArt diagrams
+3. For SmartArt: follows `<dgm:relIds>` relationships to the diagram data part and extracts `<a:t>` elements
+4. Each text run gets a unique `run_id` encoding slide, shape, paragraph, and run position
+5. Returns a structured JSON with all text, styling, and spatial constraints
+
+### Translation
+
+1. Frontend sends all extracted runs to the backend
+2. Backend checks translation memory cache first (avoiding re-translation)
+3. Uncached texts are sent to the selected provider concurrently (up to 5 parallel requests)
+4. Results are cached for future use
+
+### Injection
+
+1. Opens the original `.pptx` with `python-pptx`
+2. Groups translated runs by slide → shape
+3. For regular shapes: finds the Python-pptx `Run` object and calls `run.text = translated_text`
+4. For SmartArt: directly manipulates the diagram XML via lxml, updating `<a:t>` elements
+5. Saves the modified `.pptx`
+
+---
+
+## Development
+
+### Adding a Translation Provider
+
+1. Create a new class implementing `TranslatorInterface` in `backend/app/translators/service.py`
+2. Add the API key and URL fields to `backend/app/config.py`
+3. Register the translator in `TranslationService.__init__`
+4. Add the model option to the frontend's model selector in `app/translator/page.tsx`
+
+### Running Tests
+
+```bash
+# Backend
+cd backend && source venv/bin/activate
+python -m pytest
+
+# Frontend
+npm test
+```
+
+---
 
 ## License
 
