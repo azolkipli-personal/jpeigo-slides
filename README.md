@@ -1,262 +1,151 @@
-# jpeigo-slides | PPTX Translator
+# jpeigo-slides Portable
 
-> **XML-level PowerPoint translation** — translate `.pptx` files while preserving every pixel of formatting. Built for Japanese ↔ English localisation.
-
-Translate corporate decks, proposals, and presentations without the usual reformatting nightmare. No OCR. No image hacks. No broken layouts.
+> **XML-level PowerPoint translation** — translate `.pptx` files between English and Japanese while preserving every pixel of formatting. No installation needed — just unzip and run.
 
 ---
 
-## Why This Exists
+## Quick Start
 
-Translating PowerPoint presentations is genuinely painful. The standard approach — export to images, run OCR, translate, paste back — destroys your formatting. Font sizes break. Colors shift. Text boxes overflow. Japanese vertical text (tategaki) gets mangled. If you're localising a corporate deck with 50+ slides, every round of manual fixes costs hours.
+1. **Download** the latest portable zip from the [Releases page](https://github.com/azolkipli-personal/jpeigo-slides/releases)
+2. **Unzip** anywhere on your Windows machine
+3. **Configure** your API key (see [Setup](#-setup) below)
+4. **Double-click** `jpeigo-slides.exe`
+5. Browser opens to **http://localhost:8002** — start translating!
 
-**jpeigo-slides** works at the XML level inside the `.pptx` file, extracting text runs and re-injecting translated text without touching the layout. The result: a translated file that looks like the original, just in a different language.
+### What you get
+
+| Feature | Works? |
+|---|---|
+| Translate English ↔ Japanese | ✅ |
+| SmartArt diagrams | ✅ |
+| Tables | ✅ |
+| Grouped shapes | ✅ |
+| Vertical text (縦書き) | ✅ |
+| Formatting preservation | ✅ |
+| Slide preview images | ✅ *(requires LibreOffice)* |
+| In-app setup guide | ✅ **http://localhost:8002/setup** |
 
 ---
 
-## Features
+## ⚙️ Setup
 
-- **XML-level text extraction** — Reads text runs directly from the PPTX structure via `python-pptx`
-- **Full formatting preservation** — Font size, color, typeface, bold, italic, underline, text box positioning
-- **SmartArt / Diagram support** — Extracts and injects text from SmartArt diagrams (slides with `<dgm:pt>` elements)
-- **Table support** — Handles text within table cells
-- **Grouped shapes** — Recursive traversal of nested shape groups
-- **Vertical Japanese text** — Correctly handles tategaki (縦書き)
-- **Spatial awareness** — Auto-adjusts font size when translated text overflows its text box
-- **Translation memory** — Caches translations for consistency across slides and sessions
-- **Review interface** — Preview and edit translations before downloading
-- **Preview images** — Renders translated slides as PNG via LibreOffice + pdftoppm (with disk caching)
-- **Multi-provider** — Gemini, OpenCode (DeepSeek / Kimi / Qwen / MiniMax), Google Cloud, GLM, Kimi, MiniMax, Qwen, Ollama
+### Get an API Key
+
+The app needs at least one translation API key. **Gemini (Google)** has a free tier:
+
+1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+2. Sign in with your Google account
+3. Click **"Create API Key"** — copy the key
+
+### Configure the App
+
+1. Open the folder where you unzipped the app
+2. Go into the `backend\` subfolder
+3. Open `.env.example` in Notepad
+4. Replace `GEMINI_API_KEY=` with `GEMINI_API_KEY=AIza...` (your actual key)
+5. **Save as `.env`** (remove `.example`)
+
+That's it. Restart the app and the health indicator turns green.
+
+### Available Providers
+
+| Provider | Env Variable | Free Tier |
+|---|---|---|
+| Gemini (Google) | `GEMINI_API_KEY` | ✅ Yes |
+| OpenCode | `OPENCODE_API_KEY` | — |
+| Google Cloud | `GOOGLE_CLOUD_API_KEY` | $300 credit |
+| Qwen (Alibaba) | `QWEN_API_KEY` | ✅ Yes |
+| GLM (Zhipu) | `GLM_API_KEY` | ✅ Yes |
+| Kimi (Moonshot) | `KIMI_API_KEY` | — |
+| MiniMax | `MINIMAX_API_KEY` | — |
+
+All env vars are documented in `backend/.env.example`.
+
+---
+
+## 📦 System Requirements
+
+- **Windows 10** or later (64-bit)
+- **No Python, Node.js, or Java required** — everything is bundled in the .exe
+- **LibreOffice** *(optional)* — only needed for slide preview images. Download from [libreoffice.org](https://www.libreoffice.org/download/)
+- **Internet connection** — for translation API calls
+- ~200MB disk space
+
+---
+
+## 🖥️ Using the App
+
+| Step | What to do |
+|---|---|
+| **Upload** | Drag a `.pptx` file onto the upload area (or click to browse, max 50MB) |
+| **Configure** | Choose English or Japanese as source/target, pick a model |
+| **Translate** | Click Translate — texts are sent to the API with 5 concurrent calls |
+| **Review** | Browse slides via preview images, edit any translation inline |
+| **Export** | Click Download to save the translated `.pptx` — all formatting preserved |
+
+### Slide Preview
+
+After translation, the app renders slide preview images using **LibreOffice**. If LibreOffice isn't installed, the preview area shows a message — you can still download the translated file, it's fully correct.
+
+To enable previews: install [LibreOffice](https://www.libreoffice.org/download/) (any version) and restart the app.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────┐     ┌───────────────────┐
-│  Next.js Frontend │────▶│  Python FastAPI    │
-│  (port 3002)      │◀────│  Backend (port 8002)│
-│                   │     │                    │
-│  - Upload UI      │     │  - PPTX extraction │
-│  - Translation UI │     │  - PPTX injection  │
-│  - Slide preview  │     │  - Translation API │
-│  - Edit/Export    │     │  - Translation mem  │
-└──────────────────┘     └───────────────────┘
+┌────────────────────────────────────────┐
+│         jpeigo-slides.exe              │
+│  ┌──────────────────────────────────┐  │
+│  │  Python FastAPI (port 8002)      │  │
+│  │  ┌────────────────────────────┐  │  │
+│  │  │  Frontend (static HTML/JS) │  │  │
+│  │  ├────────────────────────────┤  │  │
+│  │  │  API Endpoints             │  │  │
+│  │  │  • /api/upload             │  │  │
+│  │  │  • /api/translate          │  │  │
+│  │  │  • /api/export             │  │  │
+│  │  │  • /api/preview            │  │  │
+│  │  │  • /api/health             │  │  │
+│  │  ├────────────────────────────┤  │  │
+│  │  │  /setup  — in-app guide    │  │  │
+│  │  └────────────────────────────┘  │  │
+│  └──────────────────────────────────┘  │
+└────────────────────────────────────────┘
 ```
 
-The Next.js frontend proxies API calls to the Python backend. The backend does all the heavy lifting — parsing the `.pptx` ZIP structure, extracting XML text runs, calling translation APIs, and re-injecting translated text into the XML.
+Everything runs as a single process on a single port. No proxies, no Node server, no separate frontend build step.
 
 ---
 
-## Prerequisites
+## 🔧 Building from Source
 
-- **Node.js** 18+
-- **Python** 3.10+
-- **LibreOffice** (for slide preview images) — `soffice` must be on PATH
-- **pdftoppm** (part of `poppler-utils`) — for PDF → PNG conversion
-- At least one **API key** for a translation provider
-
----
-
-## Installation
-
-### 1. Clone & Install Frontend
+To build the `.exe` yourself on Windows:
 
 ```bash
+# Prerequisites: Node.js 18+, Python 3.10+
 git clone https://github.com/azolkipli-personal/jpeigo-slides.git
 cd jpeigo-slides
-npm install
+git checkout windows-portable
+build.bat
 ```
 
-### 2. Set Up Python Backend
-
-```bash
-cd backend
-python3 -m venv venv
-source venv/bin/activate   # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-If `requirements.txt` doesn't exist, install dependencies manually:
-
-```bash
-pip install "python-pptx>=1.0.2" "fastapi>=0.115.0" "uvicorn[standard]>=0.34.0" \
-    "pydantic>=2.0.0" "pydantic-settings>=2.0.0" "lxml>=5.3.0" "httpx>=0.28.0"
-```
-
-### 3. Configure API Keys
-
-Copy the example env file and add your keys:
-
-```bash
-cp .env.example .env
-# Edit .env with your API keys
-```
-
-See [Configuration](#configuration) below for all available options.
-
-### 4. Start the Backend
-
-```bash
-cd backend
-source venv/bin/activate
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8002
-```
-
-Or use the convenience script:
-```bash
-chmod +x start.sh && ./start.sh
-```
-
-### 5. Start the Frontend
-
-```bash
-# From the project root
-npm run dev
-```
-
-Open **http://localhost:3002/translator** in your browser.
+The script:
+1. Installs npm deps & builds the frontend as static export
+2. Installs Python deps
+3. Packs everything into `backend\dist\jpeigo-slides.exe`
 
 ---
 
-## Configuration
+## ❓ Troubleshooting
 
-All configuration is done via environment variables in `backend/.env`.
-
-### Translation Providers (at least one required)
-
-| Variable | Description | Example |
-|---|---|---|
-| `GEMINI_API_KEY` | Google Gemini API key (free tier available) | `AIza...` |
-| `OPENCODE_API_KEY` | OpenCode API key (unified access to curated models) | `sk-...` |
-| `GOOGLE_CLOUD_API_KEY` | Google Cloud Translation API key | `AIza...` |
-| `GLM_API_KEY` | GLM-4 (BigModel) API key | — |
-| `KIMI_API_KEY` | Kimi / Moonshot API key | — |
-| `MINIMAX_API_KEY` | MiniMax API key (also needs `MINIMAX_GROUP_ID`) | — |
-| `QWEN_API_KEY` | Qwen (DashScope) API key | — |
-| `OLLAMA_URL` | Local Ollama URL for offline translation | `http://localhost:11434` |
-
-### Server Settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `CORS_ORIGINS` | `["http://localhost:3002"]` | Allowed CORS origins |
-| `DEFAULT_MODEL` | `gemini` | Default translation model |
-| `DEBUG` | `false` | Enable debug mode |
-
-### Advanced
-
-| Variable | Default | Description |
-|---|---|---|
-| `PYTHON_BACKEND_URL` (frontend `.env.local`) | `http://localhost:8002` | Backend URL for the Next.js proxy |
-| `GEMINI_API_URL` | `https://generativelanguage.googleapis.com/v1beta` | Gemini API endpoint |
-| `OPENCODE_API_URL` | `https://api.opencode.ai/v1` | OpenCode API endpoint |
-
----
-
-## Usage
-
-1. **Upload** — Drag & drop a `.pptx` file (up to 50MB)
-2. **Configure** — Select source/target language (English ↔ Japanese) and translation model
-3. **Translate** — Click Translate — all text is processed with concurrent API calls
-4. **Review** — Browse slides via preview images, edit any translation inline
-5. **Export** — Download the translated `.pptx` — all formatting preserved
-
-### Supported Models
-
-**Gemini (Google):**
-- `gemini-pro` — Gemini 3 Pro
-- `gemini-flash` — Gemini 3.5 Flash
-- `gemini-flash-lite` — Gemini 3.1 Flash Lite (fast, free tier)
-- `gemini-25-flash-lite` — Gemini 2.5 Flash Lite
-
-**OpenCode (unified API):**
-- `opencode-deepseek` — DeepSeek V4
-- `opencode-kimi` — Kimi K2.5
-- `opencode-qwen` — Qwen Max
-- `opencode-minimax` — MiniMax M2.5
-
-**Direct APIs:**
-- `glm`, `kimi`, `minimax`, `qwen`, `ollama`, `google-cloud`
-
----
-
-## Project Structure
-
-```
-jpeigo-slides/
-├── app/                    # Next.js frontend
-│   ├── api/                # API route handlers (proxies to backend)
-│   │   ├── upload-new/     # File upload endpoint
-│   │   ├── translate-new/  # Translation endpoint
-│   │   ├── export-new/     # Download endpoint
-│   │   ├── preview/        # Slide preview images
-│   │   └── health/         # Health check
-│   └── translator/         # Main translator UI page
-├── backend/
-│   └── app/
-│       ├── core/
-│       │   ├── extractor.py   # PPTX text extraction (shapes, tables, SmartArt)
-│       │   └── injector.py    # Text re-injection into PPTX XML
-│       ├── translators/
-│       │   └── service.py     # Translation providers (Gemini, OpenCode, etc.)
-│       ├── utils/
-│       │   └── cache.py       # Translation memory
-│       ├── models/            # Pydantic data models
-│       ├── config.py          # Environment variable configuration
-│       └── main.py            # FastAPI application & endpoints
-├── components/             # Shared React components
-└── package.json
-```
-
----
-
-## How It Works
-
-### Extraction
-
-1. Opens the `.pptx` as a ZIP and reads each slide's XML
-2. Iterates shapes: text boxes, grouped shapes, tables, SmartArt diagrams
-3. For SmartArt: follows `<dgm:relIds>` relationships to the diagram data part and extracts `<a:t>` elements
-4. Each text run gets a unique `run_id` encoding slide, shape, paragraph, and run position
-5. Returns a structured JSON with all text, styling, and spatial constraints
-
-### Translation
-
-1. Frontend sends all extracted runs to the backend
-2. Backend checks translation memory cache first (avoiding re-translation)
-3. Uncached texts are sent to the selected provider concurrently (up to 5 parallel requests)
-4. Results are cached for future use
-
-### Injection
-
-1. Opens the original `.pptx` with `python-pptx`
-2. Groups translated runs by slide → shape
-3. For regular shapes: finds the Python-pptx `Run` object and calls `run.text = translated_text`
-4. For SmartArt: directly manipulates the diagram XML via lxml, updating `<a:t>` elements
-5. Saves the modified `.pptx`
-
----
-
-## Development
-
-### Adding a Translation Provider
-
-1. Create a new class implementing `TranslatorInterface` in `backend/app/translators/service.py`
-2. Add the API key and URL fields to `backend/app/config.py`
-3. Register the translator in `TranslationService.__init__`
-4. Add the model option to the frontend's model selector in `app/translator/page.tsx`
-
-### Running Tests
-
-```bash
-# Backend
-cd backend && source venv/bin/activate
-python -m pytest
-
-# Frontend
-npm test
-```
+| Symptom | Fix |
+|---|---|
+| "No API keys configured" (yellow dot) | Create `backend\.env` — see [Setup](#-setup) |
+| "Preview requires LibreOffice" | Install LibreOffice, or ignore — the translated file is fine |
+| Antivirus flags the .exe | False positive from PyInstaller. Add folder to exclusions |
+| Port 8002 already in use | Add `PORT=8003` to your `backend\.env` and restart |
+| Need help? | Open an issue on [GitHub](https://github.com/azolkipli-personal/jpeigo-slides/issues) |
 
 ---
 
