@@ -2,6 +2,12 @@
 
 > **XML-level PowerPoint translation** — translate `.pptx` files while preserving every pixel of formatting. Built for Japanese ↔ English localisation.
 
+<p align="center">
+  <a href="https://github.com/sponsors/azolkipli-personal">
+    <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F%20jpeigo--slides-DB61A2?style=for-the-badge&logo=github&logoColor=white" alt="Sponsor jpeigo-slides">
+  </a>
+</p>
+
 Translate corporate decks, proposals, and presentations without the usual reformatting nightmare. No OCR. No image hacks. No broken layouts.
 
 ---
