@@ -1,0 +1,92 @@
+name: Build Portable Windows .exe
+
+on:
+  push:
+    tags:
+      - 'v*'        # v1.0.0, v1.1.0, etc.
+  workflow_dispatch: # manual trigger too
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: windows-portable  # portable build lives here
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install frontend deps & build
+        run: |
+          npm install
+          npm run build
+        shell: pwsh
+
+      - name: Copy frontend to backend
+        run: |
+          Remove-Item -Recurse -Force backend/app/frontend -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path backend/app/frontend -Force
+          Copy-Item -Recurse -Path out\* -Destination backend\app\frontend\
+        shell: pwsh
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller
+          pip install python-pptx fastapi uvicorn pydantic pydantic-settings lxml httpx
+        shell: pwsh
+
+      - name: Build executable with PyInstaller
+        run: |
+          cd backend
+          pyinstaller ^
+            --onefile ^
+            --name "jpeigo-slides" ^
+            --add-data ".;backend" ^
+            --add-data "app/frontend;backend/app/frontend" ^
+            --hidden-import "uvicorn.logging" ^
+            --hidden-import "uvicorn.loops.auto" ^
+            --hidden-import "uvicorn.protocols.http.auto" ^
+            --hidden-import "uvicorn.protocols.websocket.auto" ^
+            --hidden-import "lxml._elementpath" ^
+            --collect-submodules "pptx" ^
+            --collect-submodules "lxml" ^
+            --add-data ".env.example;." ^
+            --add-data "app/templates/setup.html;app/templates" ^
+            app/run.py
+        shell: cmd
+        working-directory: ${{ github.workspace }}
+
+      - name: Prepare distribution zip
+        run: |
+          New-Item -ItemType Directory -Path dist_folder -Force
+          Copy-Item -Path backend\dist\jpeigo-slides.exe -Destination dist_folder\
+          Copy-Item -Path backend\.env.example -Destination dist_folder\backend\
+          Compress-Archive -Path dist_folder\* -DestinationPath jpeigo-slides-portable.zip
+        shell: pwsh
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: jpeigo-slides-portable.zip
+          generate_release_notes: true
+
+      - name: Upload as artifact (manual runs)
+        uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: jpeigo-slides-portable
+          path: jpeigo-slides-portable.zip
