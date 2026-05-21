@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup Guide — jpeigo-slides</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f8f9fa; color: #333; line-height: 1.6; padding: 2rem;
+  }
+  .container { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; font-weight: 600; margin-bottom: .25rem; color: #1a1a2e; }
+  .subtitle { color: #666; font-size: .9rem; margin-bottom: 2rem; }
+  .card {
+    background: #fff; border: 1px solid #e0e0e0; border-radius: 12px;
+    padding: 1.5rem; margin-bottom: 1.25rem;
+  }
+  .card h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: .75rem; display: flex; align-items: center; gap: .5rem; }
+  .card h2 .step { background: #1a73e8; color: #fff; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: .75rem; font-weight: 700; }
+  code {
+    background: #f1f3f5; padding: .15em .4em; border-radius: 4px;
+    font-size: .85em; color: #d63384; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre {
+    background: #1e1e2e; color: #cdd6f4; border-radius: 8px; padding: 1rem;
+    overflow-x: auto; font-size: .82rem; line-height: 1.45; margin: .75rem 0;
+  }
+  pre .comment { color: #6c7086; }
+  pre .key { color: #89b4fa; }
+  pre .eq { color: #a6e3a1; }
+  pre .val { color: #f9e2af; }
+  .note { font-size: .85rem; color: #666; margin-top: .5rem; }
+  .badge { display: inline-block; background: #e8f5e9; color: #2e7d32; border-radius: 20px; padding: .15rem .6rem; font-size: .75rem; font-weight: 500; }
+  a { color: #1a73e8; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  hr { border: none; border-top: 1px solid #e0e0e0; margin: 1.5rem 0; }
+  .lang-toggle { display: flex; gap: .5rem; margin-bottom: 1.5rem; }
+  .lang-toggle button { background: transparent; border: 1px solid #ccc; border-radius: 6px; padding: .3rem .75rem; cursor: pointer; font-size: .8rem; }
+  .lang-toggle button.active { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  [lang="ja"] { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="lang-toggle">
+    <button id="btn-en" class="active" onclick="setLang('en')">EN</button>
+    <button id="btn-ja" onclick="setLang('ja')">JP</button>
+  </div>
+
+  <!-- English -->
+  <div lang="en">
+    <h1>⚙️ Setup Guide</h1>
+    <p class="subtitle">Configure your API keys to start translating</p>
+
+    <div class="card">
+      <h2><span class="step">1</span> Find the app folder</h2>
+      <p>Locate the folder where <code>jpeigo-slides.exe</code> is running (or the unzipped folder if you're using the portable version). Inside you'll find:</p>
+      <pre>📁 jpeigo-slides/<br> ┣ 📄 jpeigo-slides.exe<br> ┣ 📁 backend/<br> ┃ ┣ 📄 .env.example  ← start here<br> ┃ ┣ 📄 .env          ← create this<br> ┃ ┗ …<br> ┗ …</pre>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">2</span> Create your <code>.env</code> file</h2>
+      <p>Copy <code>.env.example</code> to <code>.env</code> and open it in a text editor (Notepad works fine).</p>
+      <pre>cp backend\.env.example backend\.env</pre>
+      <p class="note">💡 On Windows: right-click in the folder → "Open in Terminal" → paste the command above.</p>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">3</span> Add an API key</h2>
+      <p>You need at least one translation provider. Here's how to get a free Gemini key:</p>
+      <ol style="margin: .75rem 0 0 1.25rem; font-size: .9rem;">
+        <li>Go to <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a></li>
+        <li>Sign in with your Google account</li>
+        <li>Click <strong>"Create API Key"</strong></li>
+        <li>Copy the key and paste it into your <code>.env</code> file:</li>
+      </ol>
+      <pre><span class="comment"># backend/.env</span><br><span class="key">GEMINI_API_KEY</span><span class="eq">=</span><span class="val">AIzaSy...</span></pre>
+      <p>Save the file. That's it!</p>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">4</span> Restart the app</h2>
+      <p>Close the app window and run <code>jpeigo-slides.exe</code> again. The health indicator in the top-right corner will turn <span class="badge">green</span> when a key is detected.</p>
+    </div>
+
+    <hr>
+
+    <div class="card" style="background: #fff8e1; border-color: #ffe082;">
+      <h2>📖 Available providers</h2>
+      <table style="width:100%; border-collapse: collapse; font-size: .85rem;">
+        <tr style="border-bottom: 1px solid #eee;"><th style="text-align:left; padding: 6px 4px;">Provider</th><th style="text-align:left; padding: 6px 4px;">Env Variable</th><th style="text-align:left; padding: 6px 4px;">Free Tier</th></tr>
+        <tr><td style="padding: 6px 4px;">Gemini (Google)</td><td style="padding: 6px 4px;"><code>GEMINI_API_KEY</code></td><td style="padding: 6px 4px;">✅ Yes</td></tr>
+        <tr><td style="padding: 6px 4px;">OpenCode</td><td style="padding: 6px 4px;"><code>OPENCODE_API_KEY</code></td><td style="padding: 6px 4px;">—</td></tr>
+        <tr><td style="padding: 6px 4px;">Google Cloud</td><td style="padding: 6px 4px;"><code>GOOGLE_CLOUD_API_KEY</code></td><td style="padding: 6px 4px;">$300 credit</td></tr>
+        <tr><td style="padding: 6px 4px;">Qwen (Alibaba)</td><td style="padding: 6px 4px;"><code>QWEN_API_KEY</code></td><td style="padding: 6px 4px;">✅ Yes</td></tr>
+        <tr><td style="padding: 6px 4px;">GLM (Zhipu)</td><td style="padding: 6px 4px;"><code>GLM_API_KEY</code></td><td style="padding: 6px 4px;">✅ Yes</td></tr>
+        <tr><td style="padding: 6px 4px;">Kimi (Moonshot)</td><td style="padding: 6px 4px;"><code>KIMI_API_KEY</code></td><td style="padding: 6px 4px;">—</td></tr>
+        <tr><td style="padding: 6px 4px;">MiniMax</td><td style="padding: 6px 4px;"><code>MINIMAX_API_KEY</code></td><td style="padding: 6px 4px;">—</td></tr>
+      </table>
+      <p class="note" style="margin-top: .75rem;">All env vars are documented in <code>backend/.env.example</code>. Only the ones you set will appear as available in the app.</p>
+    </div>
+
+    <div class="card">
+      <h2>❓ Need help?</h2>
+      <p>Check the full README on <a href="https://github.com/azolkipli-personal/jpeigo-slides#readme" target="_blank">GitHub</a> or open an issue.</p>
+    </div>
+  </div>
+
+  <!-- Japanese -->
+  <div lang="ja">
+    <h1>⚙️ セットアップガイド</h1>
+    <p class="subtitle">翻訳を開始するにはAPIキーを設定してください</p>
+
+    <div class="card">
+      <h2><span class="step">1</span> アプリフォルダを開く</h2>
+      <p><code>jpeigo-slides.exe</code>があるフォルダ（またはポータブル版を解凍したフォルダ）を開きます。以下の構成になっています：</p>
+      <pre>📁 jpeigo-slides/<br> ┣ 📄 jpeigo-slides.exe<br> ┣ 📁 backend/<br> ┃ ┣ 📄 .env.example  ← ここから始める<br> ┃ ┣ 📄 .env          ← これを作成する<br> ┃ ┗ …<br> ┗ …</pre>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">2</span> <code>.env</code> ファイルを作成</h2>
+      <p><code>.env.example</code> を <code>.env</code> にコピーし、テキストエディタ（メモ帳でOK）で開きます。</p>
+      <pre>copy backend\.env.example backend\.env</pre>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">3</span> APIキーを追加</h2>
+      <p>少なくとも1つの翻訳プロバイダーが必要です。Gemini（無料）の設定方法：</p>
+      <ol style="margin: .75rem 0 0 1.25rem; font-size: .9rem;">
+        <li><a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a> にアクセス</li>
+        <li>Googleアカウントでログイン</li>
+        <li><strong>「APIキーを作成」</strong>をクリック</li>
+        <li>キーをコピーして <code>.env</code> に貼り付け：</li>
+      </ol>
+      <pre><span class="comment"># backend/.env</span><br><span class="key">GEMINI_API_KEY</span><span class="eq">=</span><span class="val">AIzaSy...</span></pre>
+      <p>ファイルを保存して完了です！</p>
+    </div>
+
+    <div class="card">
+      <h2><span class="step">4</span> アプリを再起動</h2>
+      <p>アプリを閉じて、もう一度 <code>jpeigo-slides.exe</code> を実行してください。右上のヘルスインジケーターが <span class="badge">緑色</span> になれば、キーが認識されています。</p>
+    </div>
+
+    <hr>
+
+    <div class="card" style="background: #fff8e1; border-color: #ffe082;">
+      <h2>📖 利用可能なプロバイダー</h2>
+      <table style="width:100%; border-collapse: collapse; font-size: .85rem;">
+        <tr style="border-bottom: 1px solid #eee;"><th style="text-align:left; padding: 6px 4px;">プロバイダー</th><th style="text-align:left; padding: 6px 4px;">環境変数</th><th style="text-align:left; padding: 6px 4px;">無料枠</th></tr>
+        <tr><td style="padding: 6px 4px;">Gemini（Google）</td><td style="padding: 6px 4px;"><code>GEMINI_API_KEY</code></td><td style="padding: 6px 4px;">✅ あり</td></tr>
+        <tr><td style="padding: 6px 4px;">OpenCode</td><td style="padding: 6px 4px;"><code>OPENCODE_API_KEY</code></td><td style="padding: 6px 4px;">—</td></tr>
+        <tr><td style="padding: 6px 4px;">Google Cloud</td><td style="padding: 6px 4px;"><code>GOOGLE_CLOUD_API_KEY</code></td><td style="padding: 6px 4px;">$300クレジット</td></tr>
+        <tr><td style="padding: 6px 4px;">Qwen（Alibaba）</td><td style="padding: 6px 4px;"><code>QWEN_API_KEY</code></td><td style="padding: 6px 4px;">✅ あり</td></tr>
+        <tr><td style="padding: 6px 4px;">GLM（Zhipu）</td><td style="padding: 6px 4px;"><code>GLM_API_KEY</code></td><td style="padding: 6px 4px;">✅ あり</td></tr>
+        <tr><td style="padding: 6px 4px;">Kimi（Moonshot）</td><td style="padding: 6px 4px;"><code>KIMI_API_KEY</code></td><td style="padding: 6px 4px;">—</td></tr>
+        <tr><td style="padding: 6px 4px;">MiniMax</td><td style="padding: 6px 4px;"><code>MINIMAX_API_KEY</code></td><td style="padding: 6px 4px;">—</td></tr>
+      </table>
+      <p class="note" style="margin-top: .75rem;">環境変数の詳細は <code>backend/.env.example</code> に記載されています。設定したものだけがアプリに表示されます。</p>
+    </div>
+
+    <div class="card">
+      <h2>❓ ヘルプが必要ですか？</h2>
+      <p><a href="https://github.com/azolkipli-personal/jpeigo-slides#readme" target="_blank">GitHubのREADME</a> をご確認いただくか、Issueを開いてください。</p>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function setLang(lang) {
+  document.querySelectorAll('[lang]').forEach(el => el.style.display = el.getAttribute('lang') === lang ? 'block' : 'none');
+  document.getElementById('btn-en').className = lang === 'en' ? 'active' : '';
+  document.getElementById('btn-ja').className = lang === 'ja' ? 'active' : '';
+}
+// Default to English
+setLang('en');
+</script>
+</body>
+</html>

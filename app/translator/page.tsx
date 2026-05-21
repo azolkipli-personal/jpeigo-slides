@@ -140,7 +140,7 @@ export default function NewTranslatorPage() {
     setPreviewImages([]); setPreviewError(null);
     try {
       const formData = new FormData(); formData.append('file', file);
-      const response = await fetch('/api/upload-new', { method: 'POST', body: formData });
+      const response = await fetch('/api/upload', { method: 'POST', body: formData });
       if (!response.ok) { const err = await response.json().catch(() => ({ error: text.uploadFailed })); throw new Error(err.error || text.uploadFailed); }
       const data = await response.json(); setDocument(data); setProgress(100);
     } catch (err) { setError(err instanceof Error ? err.message : text.uploadFailed); }
@@ -159,7 +159,7 @@ export default function NewTranslatorPage() {
       if (allRuns.length === 0) throw new Error(text.noText);
       const body: Record<string, unknown> = { runs: allRuns, source_language: sourceLang, target_language: targetLang, model, job_id: document.job_id };
       if (contextPrompt.trim()) body.context = contextPrompt.trim();
-      const response = await fetch('/api/translate-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const response = await fetch('/api/translate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!response.ok) { const err = await response.json().catch(() => ({ error: text.translationFailed })); throw new Error(err.error || text.translationFailed); }
       const data = await response.json();
       setTranslatedRuns(data.translated_runs || []);
@@ -177,7 +177,7 @@ export default function NewTranslatorPage() {
     if (!document || translatedRuns.length === 0) return;
     setExporting(true); setError(null);
     try {
-      const response = await fetch('/api/export-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: document.job_id, filename: `translated_${document.filename}` }) });
+      const response = await fetch('/api/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: document.job_id, filename: `translated_${document.filename}` }) });
       if (!response.ok) { const err = await response.json().catch(() => ({ error: text.exportFailed })); throw new Error(err.error || text.exportFailed); }
       const blob = await response.blob(); const url = window.URL.createObjectURL(blob);
       const a = window.document.createElement('a'); a.href = url; a.download = `translated_${document.filename}`;

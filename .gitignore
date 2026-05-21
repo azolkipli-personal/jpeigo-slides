@@ -41,6 +41,12 @@ backend/outputs/
 backend/.translation_cache/
 backend/venv/
 backend/test_*.pptx
+backend/app/frontend/
+
+# Build output
+out/
+dist/
+build/
 
 # env files (can opt-in for committing if needed)
 .env*

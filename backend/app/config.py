@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Server settings
     app_name: str = "PPTX Translator"
     debug: bool = False
-    cors_origins: list[str] = ["http://localhost:3002"]
+    cors_origins: list[str] = ["http://localhost:3002", "http://localhost:8002", "http://127.0.0.1:8002"]
     
     # File upload settings
     max_file_size: int = 50 * 1024 * 1024  # 50MB

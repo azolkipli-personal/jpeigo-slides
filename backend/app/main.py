@@ -3,14 +3,18 @@ FastAPI endpoints for PPTX translation.
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 import uuid
 import os
 import asyncio
+import subprocess
+import json
 from pathlib import Path
 import shutil
+import tempfile
 
 from app.config import Settings, get_settings
 from app.core.extractor import extract_pptx
@@ -36,7 +40,7 @@ app = FastAPI(
 # Load settings
 settings = get_settings()
 
-# Configure CORS for Next.js frontend
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -55,6 +59,7 @@ translation_service = TranslationService(settings)
 # Translation memory
 tm = get_translation_memory()
 
+
 def sanitize_translation(text: str, original: str) -> str:
     """
     Sanitize translation output by removing contamination like:
@@ -64,45 +69,39 @@ def sanitize_translation(text: str, original: str) -> str:
     """
     result = text.strip()
     
-    # 1. Remove leading labels like "Translation:" or "Translated text:"
+    # 1. Remove leading labels
     for label in ['Translation:', 'Translated text:', 'Output:', 'Result:', 'Translated:']:
         if label in result:
-            # Take everything after the LAST occurrence of the label
             result = result.split(label)[-1].strip()
     
-    # 2. If the result contains "original → translation" or "original = translation" pattern
-    # where original matches the source text, extract just the translation side
+    # 2. Handle "original → translation" patterns
     for sep in [' → ', ' = ']:
         if sep in result and original in result:
-            # Split by lines and find the line with the match
             lines = result.split('\n')
             cleaned_lines = []
             for line in lines:
                 line = line.strip()
                 if sep in line and original in line:
-                    # Extract the part after the separator
                     parts = line.split(sep)
                     line = parts[-1].strip()
                 cleaned_lines.append(line)
             result = '\n'.join(cleaned_lines)
     
-    # 3. If result starts with the original text verbatim, try to extract just the translation
+    # 3. Strip leading original text
     if result.startswith(original) and len(result) > len(original) + 2:
         remainder = result[len(original):].strip()
-        # Check if remainder is separated by →, =, : or just whitespace
         if remainder.startswith('→') or remainder.startswith('='):
             remainder = remainder[1:].strip()
-        if remainder:  # Only use if there's something after the original
+        if remainder:
             result = remainder
     
-    # 4. Remove any "KEYWORD → KEYWORD" patterns (duplicate word on both sides)
+    # 4. Remove duplicate-word patterns
     import re
     result = re.sub(r'\b(\w+)\s*[→=]\s*\1\b', r'\1', result)
     
-    # 5. If result contains the phrase "Context:" or "CRITICAL:" or "glossary", strip it all out
+    # 5. Strip contamination phrases
     for poison in ['Context:', 'CRITICAL:', 'glossary', 'Translate the following', 'Text to translate']:
         if poison in result:
-            # Take everything before the poison word (it's usually at the start)
             result = result.split(poison)[0].strip()
     
     # 6. Final cleanup
@@ -121,7 +120,11 @@ def sanitize_translated_runs(translated_runs: list[TranslatedRun]) -> list[Trans
             print(f"  [SANITIZE] Run {tr.run_id}: stripped contamination: {tr.translated_text[:50]} → {cleaned[:50]}")
         tr.translated_text = cleaned
     return translated_runs
+
+
 jobs: dict[str, TranslationJob] = {}
+PREVIEW_CACHE_DIR = Path("/tmp/pptx-preview-cache")
+PREVIEW_CACHE_DIR.mkdir(exist_ok=True)
 
 
 class UploadResponse(BaseModel):
@@ -148,35 +151,65 @@ class ExportResponse(BaseModel):
     download_url: str
 
 
+# ---------------------------------------------------------------------------
+# Static frontend (portable build only)
+# ---------------------------------------------------------------------------
+FRONTEND_DIR = Path(__file__).parent / "frontend"
+if FRONTEND_DIR.exists():
+    # Mount subdirectories for static assets
+    if (FRONTEND_DIR / "_next").exists():
+        app.mount("/_next", StaticFiles(directory=str(FRONTEND_DIR / "_next")), name="next")
+    if (FRONTEND_DIR / "translator").exists():
+        app.mount("/translator", StaticFiles(directory=str(FRONTEND_DIR / "translator"), html=True), name="translator")
+    if (FRONTEND_DIR / "showcase").exists():
+        app.mount("/showcase", StaticFiles(directory=str(FRONTEND_DIR / "showcase"), html=True), name="showcase")
+    # Serve root-level static assets (favicon, icons)
+    if (FRONTEND_DIR / "favicon.ico").exists():
+
+        @app.get("/favicon.ico")
+        async def _favicon():
+            return FileResponse(str(FRONTEND_DIR / "favicon.ico"))
+
+
 @app.get("/")
-async def root():
-    """Health check endpoint."""
+async def serve_frontend():
+    """Serve the frontend app, or fall back to API health."""
+    index = FRONTEND_DIR / "index.html"
+    if index.exists():
+        return HTMLResponse(content=index.read_text(encoding="utf-8"))
+    # Fallback: serve the translator as the main page
+    translator = FRONTEND_DIR / "translator" / "index.html"
+    if translator.exists():
+        return HTMLResponse(content=translator.read_text(encoding="utf-8"))
     return {"status": "ok", "service": "PPTX Translator API"}
 
 
+@app.get("/setup")
+async def setup_guide():
+    """Serve the in-app setup guide for API keys."""
+    setup_path = Path(__file__).parent / "templates" / "setup.html"
+    if setup_path.exists():
+        return HTMLResponse(content=setup_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Setup Guide</h1><p>See backend/.env.example for configuration.</p>")
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
+
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_pptx(file: UploadFile = File(...)):
-    """
-    Upload a PPTX file and extract text runs.
-    
-    Returns structured data about all text in the presentation.
-    """
-    # Validate file type
+    """Upload a PPTX file and extract text runs."""
     if not file.filename or not file.filename.endswith('.pptx'):
         raise HTTPException(status_code=400, detail="Only .pptx files are supported")
     
-    # Generate job ID
     job_id = str(uuid.uuid4())
-    
-    # Save uploaded file
     file_path = Path(settings.upload_dir) / f"{job_id}_{file.filename}"
     
     try:
-        # Save file
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Check file size
         file_size = os.path.getsize(file_path)
         if file_size > settings.max_file_size:
             os.remove(file_path)
@@ -185,10 +218,8 @@ async def upload_pptx(file: UploadFile = File(...)):
                 detail=f"File too large. Maximum size is {settings.max_file_size / (1024*1024):.0f}MB"
             )
         
-        # Extract text runs
         document = extract_pptx(str(file_path), generate_preview=True)
         
-        # Store job info
         jobs[job_id] = TranslationJob(
             job_id=job_id,
             filename=file.filename,
@@ -198,7 +229,6 @@ async def upload_pptx(file: UploadFile = File(...)):
             progress=0.0,
         )
         
-        # Prepare response
         slides_data = [
             {
                 "slide_index": s.slide_index,
@@ -237,8 +267,9 @@ async def upload_pptx(file: UploadFile = File(...)):
             slides=slides_data,
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        # Clean up on error
         if file_path.exists():
             os.remove(file_path)
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
@@ -246,15 +277,9 @@ async def upload_pptx(file: UploadFile = File(...)):
 
 @app.post("/api/translate", response_model=TranslateResponse)
 async def translate_pptx(request: TranslationRequest, background_tasks: BackgroundTasks):
-    """
-    Translate text runs in a PPTX file.
-    
-    The translation is processed in the background for large files.
-    """
-    # Use provided job_id (from upload) or create a new one
+    """Translate text runs in a PPTX file."""
     job_id = request.job_id or str(uuid.uuid4())
     
-    # Initialize or update job
     if job_id in jobs:
         jobs[job_id].status = "processing"
         jobs[job_id].total_runs = len(request.runs)
@@ -269,11 +294,9 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
             progress=0.0,
         )
     
-    # Process translations in batch with concurrency
     translated_runs = []
     tm = get_translation_memory()
     
-    # Build context from translation memory + user custom context
     glossary_context = tm.build_context_prompt(request.source_language, request.target_language)
     if request.context:
         if glossary_context:
@@ -283,10 +306,8 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
     else:
         context = glossary_context
     
-    # Prepare texts for batch translation
     texts_to_translate = [(run.run_id, run.text) for run in request.runs]
     
-    # Check cache first and collect uncached texts
     uncached = []
     for run_id, text in texts_to_translate:
         cached = tm.get(text, request.source_language, request.target_language)
@@ -305,7 +326,6 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
         else:
             uncached.append((run_id, text))
     
-    # Translate uncached texts in batch with concurrency
     if uncached:
         uncached_texts = [t[1] for t in uncached]
         batch_results = await translation_service.batch_translate(
@@ -318,7 +338,6 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
         )
         
         for (run_id, text), (translated_text, model_used, success) in zip(uncached, batch_results):
-            # Cache successful translations
             if success:
                 tm.set(
                     text=text,
@@ -337,17 +356,11 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
                 model_used=model_used,
             ))
     
-    # Sort by run_id to maintain original order
     translated_runs.sort(key=lambda tr: tr.run_id)
-    
-    # Sanitize all translations to strip contamination
     translated_runs = sanitize_translated_runs(translated_runs)
     
-    # Update job progress
     jobs[job_id].translated_runs = translated_runs
     jobs[job_id].progress = 100.0
-    
-    # Mark job as completed
     jobs[job_id].status = "completed"
     jobs[job_id].progress = 100.0
     
@@ -365,17 +378,12 @@ async def get_job(job_id: str):
     """Get job status."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
     return jobs[job_id]
 
 
 @app.post("/api/export")
 async def export_pptx(request: ExportRequest):
-    """
-    Export translated PPTX file.
-    
-    Takes the job ID and returns the translated file.
-    """
+    """Export translated PPTX file."""
     job_id = request.job_id
     
     if job_id not in jobs:
@@ -386,7 +394,6 @@ async def export_pptx(request: ExportRequest):
     if job.status != "completed":
         raise HTTPException(status_code=400, detail="Job not completed")
     
-    # Find uploaded file
     upload_dir = Path(settings.upload_dir)
     input_files = list(upload_dir.glob(f"{job_id}_*.pptx"))
     
@@ -398,20 +405,17 @@ async def export_pptx(request: ExportRequest):
     output_path = Path(settings.output_dir) / output_filename
     
     try:
-        # Inject translations
         success, failed = inject_translations(
             str(input_path),
             str(output_path),
             job.translated_runs,
-            None,  # Original document not needed for injection
+            None,
         )
         
         if not success:
-            # Log failed runs
             for run in failed:
                 print(f"Failed to inject: {run.run_id}")
         
-        # Return file
         return FileResponse(
             path=str(output_path),
             filename=output_filename,
@@ -457,7 +461,138 @@ async def health_check():
     }
 
 
-# Run with: uvicorn app.main:app --reload --port 8000
+# ---------------------------------------------------------------------------
+# Preview images (LibreOffice required for rendering)
+# ---------------------------------------------------------------------------
+
+def _preview_cache_dir(job_id: str) -> Path:
+    return PREVIEW_CACHE_DIR / job_id
+
+
+def _load_cached_preview(job_id: str) -> Optional[list[str]]:
+    cache_dir = _preview_cache_dir(job_id)
+    if not cache_dir.exists():
+        return None
+    pngs = sorted(
+        [f for f in cache_dir.iterdir() if f.suffix == ".png"],
+        key=lambda f: int(f.stem.split("-")[1]) if "-" in f.stem and f.stem.split("-")[1].isdigit() else 0,
+    )
+    if not pngs:
+        return None
+    import base64
+    return [f"data:image/png;base64,{base64.b64encode(p.read_bytes()).decode()}" for p in pngs]
+
+
+def _find_libreoffice() -> Optional[str]:
+    """Find LibreOffice executable on any platform."""
+    candidates = ["soffice", "libreoffice"]
+    if os.name == "nt":  # Windows
+        candidates = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ] + candidates
+    for cmd in candidates:
+        try:
+            subprocess.run([cmd, "--help"], capture_output=True, timeout=5)
+            return cmd
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+@app.post("/api/preview")
+async def generate_preview(request: dict):
+    """Generate slide preview images from a translated PPTX."""
+    job_id = request.get("job_id")
+    filename = request.get("filename", "translated.pptx")
+    
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required")
+    
+    # Check cache first
+    cached = _load_cached_preview(job_id)
+    if cached:
+        return {"images": cached, "total": len(cached), "cached": True}
+    
+    # Check LibreOffice availability
+    lo = _find_libreoffice()
+    if not lo:
+        raise HTTPException(status_code=503, detail="Preview requires LibreOffice. Install from libreoffice.org")
+    
+    # Get the translated PPTX
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail="Job not completed")
+    
+    upload_dir = Path(settings.upload_dir)
+    input_files = list(upload_dir.glob(f"{job_id}_*.pptx"))
+    if not input_files:
+        raise HTTPException(status_code=404, detail="Original file not found")
+    
+    output_path = Path(settings.output_dir) / filename
+    success, failed = inject_translations(
+        str(input_files[0]), str(output_path), job.translated_runs, None
+    )
+    
+    if not output_path.exists():
+        raise HTTPException(status_code=500, detail="Failed to generate translated file")
+    
+    # Convert to preview images
+    work_dir = Path(tempfile.mkdtemp(prefix="pptx-preview-"))
+    try:
+        pptx_path = work_dir / "slides.pptx"
+        shutil.copy2(output_path, pptx_path)
+        
+        # LibreOffice: PPTX → PDF
+        subprocess.run(
+            [lo, "--headless", "--convert-to", "pdf", "--outdir", str(work_dir), str(pptx_path)],
+            timeout=60, capture_output=True,
+        )
+        
+        pdf_path = work_dir / "slides.pdf"
+        if not pdf_path.exists():
+            raise HTTPException(status_code=500, detail="LibreOffice conversion failed")
+        
+        # pdftoppm: PDF → PNGs
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", "150", str(pdf_path), str(work_dir / "slide")],
+            timeout=60, capture_output=True,
+        )
+        
+        # Collect PNGs
+        png_files = sorted(
+            [f for f in work_dir.iterdir() if f.name.startswith("slide-") and f.suffix == ".png"],
+            key=lambda f: int(f.stem.split("-")[1]) if "-" in f.stem and f.stem.split("-")[1].isdigit() else 0,
+        )
+        
+        if not png_files:
+            raise HTTPException(status_code=500, detail="No preview images generated")
+        
+        import base64
+        images = [
+            f"data:image/png;base64,{base64.b64encode(p.read_bytes()).decode()}"
+            for p in png_files
+        ]
+        
+        # Cache for next time
+        cache_dir = _preview_cache_dir(job_id)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for p in png_files:
+            shutil.copy2(p, cache_dir / p.name)
+        
+        return {"images": images, "total": len(images), "cached": False}
+        
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
