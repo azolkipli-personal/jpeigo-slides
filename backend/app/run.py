@@ -20,7 +20,11 @@ else:
     os.chdir(BASE_DIR)
 
 # Ensure backend modules are importable
-sys.path.insert(0, str(BASE_DIR))
+if getattr(sys, "frozen", False):
+    sys.path.insert(0, str(BASE_DIR))
+    sys.path.insert(0, str(BASE_DIR / "backend"))
+else:
+    sys.path.insert(0, str(BASE_DIR))
 
 # Load .env from the executable's working directory
 env_path = Path.cwd() / "backend" / ".env"
