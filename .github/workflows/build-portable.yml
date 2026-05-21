@@ -6,6 +6,9 @@ on:
       - 'v*'        # v1.0.0, v1.1.0, etc.
   workflow_dispatch: # manual trigger too
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -78,8 +81,16 @@ jobs:
           Compress-Archive -Path dist_folder\* -DestinationPath jpeigo-slides-portable.zip
         shell: pwsh
 
-      - name: Upload as artifact
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: jpeigo-slides-portable.zip
+          generate_release_notes: true
+
+      - name: Upload as artifact (fallback)
         uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           name: jpeigo-slides-portable
           path: jpeigo-slides-portable.zip
