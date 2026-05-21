@@ -30,6 +30,18 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Backend runtime artifacts
+backend/uploads/
+backend/outputs/
+backend/.translation_cache/
+backend/venv/
+backend/test_*.pptx
+
 # env files (can opt-in for committing if needed)
 .env*
 

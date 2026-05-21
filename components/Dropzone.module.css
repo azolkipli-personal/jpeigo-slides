@@ -1,29 +1,29 @@
 .dropzone {
-  border: 2px dashed rgba(255, 255, 255, 0.3);
+  border: 2px dashed #d1d5db;
   border-radius: 16px;
   padding: 60px 40px;
   text-align: center;
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.8);
   backdrop-filter: blur(10px);
-  color: #fff;
+  color: #475569;
   position: relative;
   overflow: hidden;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
 .dropzone:hover, .active {
-  border-color: #8b5cf6; /* Violet */
-  background: rgba(139, 92, 246, 0.1);
-  box-shadow: 0 10px 15px rgba(139, 92, 246, 0.2);
-  transform: translateY(-2px);
+  border-color: #818cf8;
+  background: rgba(238, 242, 255, 0.9);
+  box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15);
+  transform: translateY(-1px);
 }
 
 .loading {
   cursor: default;
-  border-color: rgba(255, 255, 255, 0.1);
-  background: rgba(0, 0, 0, 0.2);
+  border-color: #e2e8f0;
+  background: rgba(248, 250, 252, 0.9);
 }
 
 .content {
@@ -41,14 +41,14 @@
 .text {
   font-size: 1.1rem;
   font-weight: 500;
-  color: #e0e0e0;
+  color: #64748b;
 }
 
 .spinner {
   width: 40px;
   height: 40px;
-  border: 4px solid rgba(255, 255, 255, 0.1);
-  border-left-color: #8b5cf6;
+  border: 4px solid #e2e8f0;
+  border-left-color: #818cf8;
   border-radius: 50%;
   animation: spin 1s linear infinite;
 }

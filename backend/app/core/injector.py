@@ -10,8 +10,19 @@ from pptx.text.text import TextFrame
 from pptx.util import Pt, Emu
 from typing import Optional
 import copy
+from lxml import etree
 
 from app.models import TranslatedRun, TranslationJob, SpatialConstraints
+
+
+SMARTART_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData'
+SMARTART_DGM_URI = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
+PPTX_NS = {
+    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+    'dgm': 'http://schemas.openxmlformats.org/drawingml/2006/diagram',
+}
 
 
 # Average character widths for font size estimation
@@ -113,7 +124,7 @@ def find_shape_by_index(shape, shape_idx: str) -> Optional[Shape]:
     Find a shape by its index, handling nested groups.
     shape_idx can be like "0", "1_0", "1_table_0_0"
     """
-    parts = str(shape_idx).split('_')
+    parts = str(shape_idx).split('.')
     
     # Handle table cells
     if 'table' in shape_idx:
@@ -126,12 +137,88 @@ def find_shape_by_index(shape, shape_idx: str) -> Optional[Shape]:
             first_idx = int(parts[0])
             sub_shape = list(shape.shapes)[first_idx]
             if len(parts) > 1:
-                return find_shape_by_index(sub_shape, '_'.join(parts[1:]))
+                return find_shape_by_index(sub_shape, '.'.join(parts[1:]))
             return sub_shape
     except (IndexError, ValueError):
         pass
     
     return None
+
+
+def inject_smartart_text(
+    shape: GraphicFrame,
+    translated_runs: list[TranslatedRun],
+    slide_idx: int,
+) -> list[TranslatedRun]:
+    """Inject translated text into a SmartArt diagram via its XML."""
+    failed_runs = []
+    try:
+        shape_el = shape._element
+        graphic_data = shape_el.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData')
+        if graphic_data is None:
+            return translated_runs
+        
+        uri = graphic_data.get('uri', '')
+        if SMARTART_DGM_URI not in uri:
+            return translated_runs
+        
+        # Find relId — SmartArt uses <dgm:relIds> with r:dm
+        rel_ids_el = graphic_data.find('.//dgm:relIds', PPTX_NS)
+        rel_id = None
+        if rel_ids_el is not None:
+            rel_id = rel_ids_el.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}dm')
+        else:
+            for child in graphic_data:
+                rel_id = child.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                if rel_id:
+                    break
+        
+        if not rel_id:
+            return translated_runs
+        
+        # Get slide part
+        try:
+            # Access the diagram data part via relationship
+            dgm_part = shape.part.related_part(rel_id) if hasattr(shape, 'part') else None
+        except (KeyError, AttributeError):
+            dgm_part = None
+        
+        if dgm_part is None:
+            return translated_runs
+        
+        dgm_xml = etree.fromstring(dgm_part.blob)
+        
+        a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        
+        for tr in translated_runs:
+            try:
+                run_parts = tr.run_id.split('_')
+                run_idx = int(run_parts[4]) if len(run_parts) > 4 else 0
+                
+                # Find the corresponding <a:t> element in the data model
+                # Scan through all <dgm:pt> → <a:t> elements
+                a_t_elements = []
+                for pt in dgm_xml.iter(f'{{{PPTX_NS["dgm"]}}}pt'):
+                    for t_elem in pt.iter(f'{{{a_ns}}}t'):
+                        a_t_elements.append(t_elem)
+                
+                if run_idx < len(a_t_elements):
+                    t_elem = a_t_elements[run_idx]
+                    t_elem.text = tr.translated_text
+                else:
+                    failed_runs.append(tr)
+            except Exception:
+                failed_runs.append(tr)
+        
+        # Write back modified XML
+        if len(failed_runs) < len(translated_runs):
+            dgm_part._blob = etree.tostring(dgm_xml, xml_declaration=True, encoding='UTF-8')
+        
+    except Exception as e:
+        print(f"[INJECTOR] SmartArt injection error: {e}")
+        failed_runs.extend(translated_runs)
+    
+    return failed_runs
 
 
 def replace_text_in_shape(
@@ -154,7 +241,7 @@ def replace_text_in_shape(
                 sub_shape,
                 translated_runs,
                 slide_idx,
-                f"{shape_idx}_{sub_idx}",
+                f"{shape_idx}.{sub_idx}",
             )
             failed_runs.extend(runs)
         return failed_runs
@@ -163,29 +250,40 @@ def replace_text_in_shape(
     if isinstance(shape, GraphicFrame) and shape.has_table:
         table = shape.table
         for translated_run in translated_runs:
-            # Parse shape_idx like "0_table_0_0" for row 0, col 0
-            parts = str(translated_run.run_id).split('_')
             try:
-                # Find position from run_id
-                run_parts = translated_run.run_id.replace('run_', '').split('_')
-                table_row = int(run_parts[3]) if len(run_parts) > 3 else 0
-                table_col = int(run_parts[4]) if len(run_parts) > 4 else 0
+                run_parts = translated_run.run_id.split('_')
+                shape_segments = run_parts[2].split('.') if len(run_parts) > 2 else []
+                
+                table_row = 0
+                table_col = 0
+                if len(shape_segments) >= 4 and 'table' in shape_segments:
+                    table_row = int(shape_segments[2])
+                    table_col = int(shape_segments[3])
                 
                 cell = table.rows[table_row].cells[table_col]
-                # Find and replace the specific run
-                paragraph_idx = translated_run.run_id.split('_')[-2] if '_' in translated_run.run_id else 0
+                paragraph_idx = int(run_parts[3]) if len(run_parts) > 3 else 0
+                run_offset = int(run_parts[4]) if len(run_parts) > 4 else 0
+                
+                para = list(cell.text_frame.paragraphs)[paragraph_idx]
+                run = list(para.runs)[run_offset]
+                
                 try:
-                    para = list(cell.text_frame.paragraphs)[int(paragraph_idx)]
-                    run_offset = int(run_parts[-1]) if len(run_parts) > 5 else 0
-                    run = list(para.runs)[run_offset]
-                    set_run_text_safe(run, translated_run.translated_text)
-                    if translated_run.adjusted_font_size:
-                        run.font.size = Pt(translated_run.adjusted_font_size)
-                except (IndexError, ValueError):
-                    failed_runs.append(translated_run)
-            except (IndexError, ValueError):
+                    orig_font_size = run.font.size
+                except Exception:
+                    orig_font_size = None
+                
+                set_run_text_safe(run, translated_run.translated_text)
+                
+                if translated_run.adjusted_font_size:
+                    run.font.size = Pt(translated_run.adjusted_font_size)
+                        
+            except (IndexError, ValueError) as e:
                 failed_runs.append(translated_run)
         return failed_runs
+    
+    # Handle SmartArt diagrams
+    if isinstance(shape, GraphicFrame) and 'smartart' in str(translated_runs[0].run_id if translated_runs else ''):
+        return inject_smartart_text(shape, translated_runs, slide_idx)
     
     # Handle regular shapes with text frames
     if not hasattr(shape, 'text_frame') or shape.text_frame is None:
@@ -196,13 +294,15 @@ def replace_text_in_shape(
     # Group runs by paragraph
     runs_by_paragraph = {}
     for tr in translated_runs:
-        para_idx = tr.run_id.split('_')[-2] if '_' in tr.run_id else '0'
+        para_parts = tr.run_id.split('_')
+        para_idx = para_parts[3] if len(para_parts) > 3 else '0'
         if para_idx not in runs_by_paragraph:
             runs_by_paragraph[para_idx] = []
         runs_by_paragraph[para_idx].append(tr)
     
     # Replace text in each paragraph
     paragraphs = list(text_frame.paragraphs)
+    print(f"  [INJECTOR] shape {shape_idx}: {len(paragraphs)} paragraphs, {len(runs_by_paragraph)} run groups")
     
     for para_idx_str, runs in runs_by_paragraph.items():
         try:
@@ -214,14 +314,23 @@ def replace_text_in_shape(
             paragraph_runs = list(paragraph.runs)
             
             for tr in runs:
-                run_parts = tr.run_id.split('_')
-                run_idx = int(run_parts[-1]) if len(run_parts) >= 4 else 0
+                run_i_parts = tr.run_id.split('_')
+                run_idx = int(run_i_parts[4]) if len(run_i_parts) > 4 else 0
                 
                 if run_idx < len(paragraph_runs):
                     run = paragraph_runs[run_idx]
+                    
+                    # Read original font size to preserve
+                    orig_font_size = None
+                    try:
+                        if run.font.size:
+                            orig_font_size = run.font.size
+                    except Exception:
+                        pass
+                    
                     set_run_text_safe(run, tr.translated_text)
                     
-                    # Apply font size adjustment if needed
+                    # Apply font size adjustment if explicitly set (from check_text_fit logic)
                     if tr.adjusted_font_size:
                         run.font.size = Pt(tr.adjusted_font_size)
                 else:
@@ -273,7 +382,8 @@ def inject_translations(
             # Group runs by shape
             runs_by_shape = {}
             for tr in slide_runs:
-                shape_idx = '_'.join(tr.run_id.split('_')[2:4]) if '_' in tr.run_id else '0'
+                rid_parts = tr.run_id.split('_')
+                shape_idx = rid_parts[2] if len(rid_parts) > 2 else '0'
                 if shape_idx not in runs_by_shape:
                     runs_by_shape[shape_idx] = []
                 runs_by_shape[shape_idx].append(tr)
@@ -281,11 +391,20 @@ def inject_translations(
             # Process each shape
             for shape_idx_str, shape_runs in runs_by_shape.items():
                 try:
-                    shape_idx_parts = shape_idx_str.split('_')
+                    shape_idx_parts = shape_idx_str.split('.')
+                    
+                    # Handle SmartArt shapes
+                    is_smartart = 'smartart' in shape_idx_str
                     
                     # Find the shape
                     shape = None
-                    if len(shape_idx_parts) == 1:
+                    if is_smartart:
+                        # SmartArt: find the GraphicFrame in the slide
+                        for s_idx, s in enumerate(slide.shapes):
+                            if isinstance(s, GraphicFrame):
+                                shape = s
+                                break
+                    elif len(shape_idx_parts) == 1:
                         # Simple index
                         idx = int(shape_idx_parts[0])
                         shape = slide.shapes[idx]
@@ -298,8 +417,8 @@ def inject_translations(
                             # Table cell - handled in replace_text_in_shape
                             pass
                         elif isinstance(shape, GroupShape):
-                            # Nested group
-                            shape = find_shape_by_index(shape, '_'.join(shape_idx_parts[1:]))
+                            # Nested group — use '.' separator to match find_shape_by_index
+                            shape = find_shape_by_index(shape, '.'.join(shape_idx_parts[1:]))
                     
                     if shape:
                         failed = replace_text_in_shape(shape, shape_runs, slide_idx, shape_idx_str)
@@ -319,6 +438,12 @@ def inject_translations(
             failed_runs.extend(slide_runs)
     
     # Save the translated presentation
+    print(f"[INJECTOR] Processed {len(translated_runs)} runs, {len(failed_runs)} failed")
     prs.save(output_path)
+    
+    if failed_runs:
+        print(f"[INJECTOR] Failed runs:")
+        for fr in failed_runs[:10]:
+            print(f"  {fr.run_id}: {fr.original_text[:30]} -> {fr.translated_text[:30]}")
     
     return len(failed_runs) == 0, failed_runs

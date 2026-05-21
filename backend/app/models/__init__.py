@@ -88,6 +88,7 @@ class TranslationRequest(BaseModel):
     target_language: str = "en"  # english default
     model: str = "auto"  # auto, glm, kimi, minimax, qwen, ollama
     context: Optional[str] = None
+    job_id: Optional[str] = None  # upload job_id to track progress
 
 
 class TranslatedRun(BaseModel):

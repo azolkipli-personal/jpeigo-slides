@@ -4,9 +4,9 @@
 }
 
 .title {
-    font-size: 1.8rem;
+    font-size: 1.5rem;
     margin-bottom: 24px;
-    color: #fff;
+    color: #334155;
     font-weight: 600;
     text-align: center;
 }
@@ -14,28 +14,29 @@
 .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 32px;
+    gap: 24px;
 }
 
 .card {
-    background: rgba(255, 255, 255, 0.05);
+    background: #fff;
     border-radius: 16px;
     overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    transition: transform 0.3s ease, box-shadow 0.3s ease;
-    animation: fadeIn 0.6s cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    animation: fadeIn 0.5s ease backwards;
 }
 
 .card:hover {
-    transform: translateY(-8px);
-    box-shadow: 0 20px 30px rgba(0, 0, 0, 0.3);
-    border-color: rgba(139, 92, 246, 0.4);
+    transform: translateY(-4px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    border-color: #c7d2fe;
 }
 
 .imageWrapper {
     width: 100%;
     aspect-ratio: 16 / 9;
-    background: #111;
+    background: #f1f5f9;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -46,25 +47,26 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
-    transition: transform 0.5s ease;
+    transition: transform 0.4s ease;
 }
 
 .card:hover .image {
-    transform: scale(1.05);
+    transform: scale(1.04);
 }
 
 .caption {
-    padding: 16px;
-    font-size: 1rem;
-    color: #ccc;
-    border-top: 1px solid rgba(255, 255, 255, 0.05);
-    background: rgba(0, 0, 0, 0.2);
+    padding: 14px 16px;
+    font-size: 0.875rem;
+    color: #64748b;
+    border-top: 1px solid #f1f5f9;
+    background: #fafafa;
+    font-weight: 500;
 }
 
 @keyframes fadeIn {
     from {
         opacity: 0;
-        transform: translateY(30px);
+        transform: translateY(20px);
     }
 
     to {

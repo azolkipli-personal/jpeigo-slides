@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3002",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 3002",
     "lint": "eslint",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -15,6 +15,7 @@
   "dependencies": {
     "@google-cloud/translate": "^9.3.0",
     "@google-cloud/vision": "^5.3.4",
+    "@tailwindcss/postcss": "^4.3.0",
     "axios": "^1.13.2",
     "canvas": "^3.2.1",
     "class-variance-authority": "^0.7.1",

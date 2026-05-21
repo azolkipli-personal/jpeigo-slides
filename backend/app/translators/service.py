@@ -38,9 +38,10 @@ class TranslatorInterface(ABC):
 class GeminiTranslator(TranslatorInterface):
     """Google Gemini translator (free tier available)."""
     
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, model: str = "gemini-2.5-flash-lite"):
         self.api_url = settings.gemini_api_url
         self.api_key = settings.gemini_api_key
+        self.model = model
     
     async def translate(
         self,
@@ -57,20 +58,25 @@ class GeminiTranslator(TranslatorInterface):
             'en': 'English',
         }
         
-        prompt = f"""Translate the following text from {lang_map.get(source_lang, source_lang)} to {lang_map.get(target_lang, target_lang)}.
-Preserve the original formatting and structure. Only provide the translation, no explanations.
-
-{f'Context: {context}' if context else ''}
-
-Text to translate:
-{text}
-
-Translation:"""
+        parts = []
+        if context:
+            parts.append(context.strip())
+        parts.append(
+            f"Translate the following {lang_map.get(source_lang, source_lang)} text to {lang_map.get(target_lang, target_lang)}."
+        )
+        parts.append(
+            "CRITICAL: Return ONLY the translated text. Do NOT include the original text, "
+            "do NOT include arrows (→), do NOT include colons or labels, "
+            "do NOT include the glossary or any other metadata. Just the translation itself."
+        )
+        parts.append(f"Text:\n{text}")
+        parts.append("Translation:")
+        prompt = "\n\n".join(parts)
         
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
-                    f"{self.api_url}/models/gemini-1.5-flash:generateContent",
+                    f"{self.api_url}/models/{self.model}:generateContent",
                     headers={
                         "Content-Type": "application/json",
                     },
@@ -94,11 +100,11 @@ Translation:"""
                             return translated.strip(), True
                 return text, False
         except Exception as e:
-            print(f"Gemini translation error: {e}")
+            print(f"Gemini translation error ({self.model}): {e}")
             return text, False
     
     def get_model_name(self) -> str:
-        return "gemini-1.5-flash"
+        return self.model
 
 
 class OpenCodeTranslator(TranslatorInterface):
@@ -133,7 +139,7 @@ Original: {text}
 Translation:"""
         
         # Model selection: auto picks best available
-        model_id = self.model if self.model != "auto"else"glm-4"
+        model_id = self.model if self.model != "auto"else"deepseek-v4-flash"
         
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -495,48 +501,52 @@ class TranslationService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.translators = {
+            # Gemini models (queried from live API)
+            'gemini-pro': GeminiTranslator(settings, 'gemini-3-pro-preview'),
+            'gemini-flash': GeminiTranslator(settings, 'gemini-3.5-flash'),
+            'gemini-flash-lite': GeminiTranslator(settings, 'gemini-3.1-flash-lite'),
+            'gemini-25-flash-lite': GeminiTranslator(settings, 'gemini-2.5-flash-lite'),
+            # OpenCode models (proxy to the best available)
+            'opencode-deepseek': OpenCodeTranslator(settings, 'deepseek-v4-flash'),
+            'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k2-5'),
+            'opencode-qwen': OpenCodeTranslator(settings, 'qwen-max'),
+            'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m2-5'),
+            # Fallback / direct APIs (kept for compatibility)
             'glm': GLMTranslator(settings),
             'kimi': KimiTranslator(settings),
             'minimax': MiniMaxTranslator(settings),
             'qwen': QwenTranslator(settings),
-            'gemini': GeminiTranslator(settings),
-            'opencode': OpenCodeTranslator(settings, 'auto'),
-            'opencode-glm': OpenCodeTranslator(settings, 'glm-4'),
-            'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k2-5'),
-            'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m2-5'),
             'ollama': OllamaTranslator(settings),
+            'google-cloud': GoogleCloudTranslator(settings),
         }
     
     def get_translator(self, model: str) -> TranslatorInterface:
         """Get the appropriate translator for a model."""
         if model == 'auto':
-            # Auto-select based on availability (priority: free/cheap first)
-            # Google Cloud is fastest and most reliable
+            # Auto-select based on availability (Gemini flash-lite is fast & free)
+            if self.settings.gemini_api_key:
+                return self.translators['gemini-flash-lite']
+            if self.settings.opencode_api_key:
+                return self.translators['opencode-deepseek']
             if self.settings.google_cloud_api_key:
                 return self.translators['google-cloud']
-            if self.settings.gemini_api_key:
-                return self.translators['gemini']
-            if self.settings.opencode_api_key:
-                return self.translators['opencode']
             if self.settings.qwen_api_key:
                 return self.translators['qwen']
-            if self.settings.kimi_api_key:
-                return self.translators['kimi']
-            if self.settings.glm_api_key:
-                return self.translators['glm']
-            if self.settings.minimax_api_key:
-                return self.translators['minimax']
             if self.settings.ollama_url:
                 return self.translators['ollama']
-            # Default to Google Cloud even without key (will fail gracefully)
             return self.translators['google-cloud']
         
-        # Handle opencode sub-models
+        # Direct match (e.g. 'gemini-pro', 'opencode-kimi')
+        if model in self.translators:
+            return self.translators[model]
+        
+        # Handle opencode sub-models by prefix
         if model.startswith('opencode-'):
             submodel = model.replace('opencode-', '')
             return OpenCodeTranslator(self.settings, submodel)
         
-        return self.translators.get(model, self.translators['gemini'])
+        # Default to Gemini flash lite
+        return self.translators.get('gemini-flash-lite', self.translators['gemini-flash-lite'])
     
     async def translate_text(
         self,

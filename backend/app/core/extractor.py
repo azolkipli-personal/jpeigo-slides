@@ -28,7 +28,10 @@ PPTX_NAMESPACES = {
     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
     'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+    'dgm': 'http://schemas.openxmlformats.org/drawingml/2006/diagram',
 }
+
+SMARTART_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData'
 
 
 def get_shape_id(shape: Shape) -> int:
@@ -157,9 +160,18 @@ def get_spatial_constraints(shape: Shape) -> SpatialConstraints:
         return SpatialConstraints(left=0, top=0, width=0, height=0)
 
 
-def generate_run_id(slide_idx: int, shape_idx: int, para_idx: int, run_idx: int) -> str:
+_run_counter: int = 0
+_box_counter: int = 0
+
+
+def generate_run_id(slide_idx: int, shape_idx: int | str, para_idx: int, run_idx: int) -> str:
     """Generate a unique ID for a text run."""
-    return f"run_{slide_idx}_{shape_idx}_{para_idx}_{run_idx}"
+    global _run_counter
+    # Use '.' to join compound shape paths so the run_id remains parseable
+    shape_str = str(shape_idx).replace('_', '.')
+    run_id = f"run_{slide_idx}_{shape_str}_{para_idx}_{run_idx}_{_run_counter}"
+    _run_counter += 1
+    return run_id
 
 
 def get_xml_path(run) -> str:
@@ -183,21 +195,31 @@ def get_xml_path(run) -> str:
 def extract_runs_from_text_frame(
     text_frame: TextFrame,
     slide_idx: int,
-    shape_idx: int,
+    shape_idx: int | str,
     shape_type: str,
+    run_id_shape_idx: int | str | None = None,
 ) -> list[TextRun]:
-    """Extract all text runs from a text frame."""
+    """Extract all text runs from a text frame.
+    
+    Args:
+        text_frame: The text frame to extract from
+        slide_idx: Slide index
+        shape_idx: Shape index stored in the model (must be int-compatible)
+        shape_type: Type of shape
+        run_id_shape_idx: If different from shape_idx (e.g., table cell path),
+                          used for run_id generation only. Defaults to shape_idx.
+    """
     runs = []
+    effective_run_id_idx = run_id_shape_idx if run_id_shape_idx is not None else shape_idx
     
     for para_idx, paragraph in enumerate(text_frame.paragraphs):
         for run_idx, run in enumerate(paragraph.runs):
-            # Skip empty runs
             if not run.text.strip():
                 continue
             
             style = extract_style_from_run(run)
             xml_path = get_xml_path(run)
-            run_id = generate_run_id(slide_idx, shape_idx, para_idx, run_idx)
+            run_id = generate_run_id(slide_idx, effective_run_id_idx, para_idx, run_idx)
             
             text_run = TextRun(
                 run_id=run_id,
@@ -214,45 +236,149 @@ def extract_runs_from_text_frame(
     return runs
 
 
+# SmartArt text extraction
+SMARTART_DGM_URI = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
+
+
+def extract_smartart_text(
+    shape: GraphicFrame,
+    slide_part,
+    slide_idx: int,
+    shape_idx: int | str,
+) -> list[TextRun]:
+    """Extract text from a SmartArt diagram shape."""
+    runs = []
+    try:
+        shape_el = shape._element
+        # Find the graphic data element — it's in the a: namespace, not p:
+        graphic_data = shape_el.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData')
+        if graphic_data is None:
+            return runs
+        
+        # Check if this is a SmartArt (not a chart or table)
+        uri = graphic_data.get('uri', '')
+        if SMARTART_DGM_URI not in uri:
+            return runs
+        
+        # Find the dgm relationship ID — SmartArt uses <dgm:relIds> with r:dm, r:lo, r:qs, r:cs
+        rel_ids_el = graphic_data.find('.//dgm:relIds', PPTX_NAMESPACES)
+        rel_id = None
+        if rel_ids_el is not None:
+            rel_id = rel_ids_el.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}dm')
+        else:
+            # Fallback: try direct relId on child elements
+            for child in graphic_data:
+                rel_id = child.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                if rel_id:
+                    break
+        
+        if not rel_id:
+            return runs
+        
+        # Access the diagram data part via relationship
+        try:
+            dgm_part = slide_part.related_part(rel_id)
+            dgm_xml = etree.fromstring(dgm_part.blob)
+        except (KeyError, AttributeError) as e:
+            return runs
+        
+        # Find all text elements in the diagram
+        # SmartArt stores text in <dgm:t> → <a:p> → <a:r> → <a:t> elements
+        # We extract from <a:t> which contains the actual text
+        a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        text_idx = 0
+        for pt in dgm_xml.iter(f'{{{PPTX_NAMESPACES["dgm"]}}}pt'):
+            for t_elem in pt.iter(f'{{{a_ns}}}t'):
+                text = (t_elem.text or '').strip()
+                if not text:
+                    continue
+                
+                # Build XML path for re-injection
+                parts = []
+                elem = t_elem
+                while elem is not None:
+                    tag = elem.tag
+                    if '}' in tag:
+                        tag = tag.split('}')[1]
+                    parts.append(tag)
+                    elem = elem.getparent()
+                xml_path = '/'.join(reversed(parts))
+                
+                run_id = generate_run_id(slide_idx, f"smartart_{shape_idx}", 0, text_idx)
+                text_idx += 1
+                
+                runs.append(TextRun(
+                    run_id=run_id,
+                    text=text,
+                    style=FontStyle(),
+                    slide_index=slide_idx,
+                    shape_index=shape_idx,
+                    paragraph_index=0,
+                    run_index=text_idx,
+                    xml_path=xml_path,
+                ))
+    except Exception as e:
+        print(f"[EXTRACTOR] SmartArt extraction error: {e}")
+    
+    return runs
+
+
 def extract_from_shape(
     shape: Shape,
     slide_idx: int,
-    shape_idx: int,
+    shape_idx: int | str,
+    slide_part=None,  # pptx.opc.package.Part for accessing relationships
 ) -> list[TextBox]:
     """Extract text boxes from a shape (recursive for groups)."""
     text_boxes = []
-    
+
     # Handle group shapes recursively
     if isinstance(shape, GroupShape):
         for sub_idx, sub_shape in enumerate(shape.shapes):
-            text_boxes.extend(extract_from_shape(sub_shape, slide_idx, shape_idx))
+            nested_shape_path = f"{shape_idx}_{sub_idx}"
+            text_boxes.extend(extract_from_shape(sub_shape, slide_idx, nested_shape_path, slide_part))
         return text_boxes
-    
+
     # Handle graphic frames (charts, diagrams, tables)
     if isinstance(shape, GraphicFrame):
+        # Check for tables first
         if shape.has_table:
             table: Table = shape.table
             for row_idx, row in enumerate(table.rows):
                 for col_idx, cell in enumerate(row.cells):
                     if cell.text_frame:
-                        # Keep shape_idx as int, use compound ID for uniqueness
+                        # Use compound ID so run_id encodes row/col position
                         table_id = f"{shape_idx}_table_{row_idx}_{col_idx}"
                         runs = extract_runs_from_text_frame(
                             cell.text_frame,
                             slide_idx,
-                            shape_idx,  # Keep as integer
+                            shape_idx,  # int for the model
                             "table_cell",
+                            run_id_shape_idx=table_id,  # compound ID for run_id only
                         )
                         if runs:
                             constraints = get_spatial_constraints(shape)
+                            tb_shape_idx = int(shape_idx) if isinstance(shape_idx, (int, str)) and str(shape_idx).isdigit() else 0
                             text_boxes.append(TextBox(
                                 box_id=f"box_{slide_idx}_{table_id}",
                                 shape_type="table_cell",
                                 slide_index=slide_idx,
-                                shape_index=shape_idx,  # Keep as integer
+                                shape_index=tb_shape_idx,  # int for model
                                 runs=runs,
                                 constraints=constraints,
                             ))
+        # SmartArt diagrams
+        if slide_part is not None:
+            smartart_texts = extract_smartart_text(shape, slide_part, slide_idx, shape_idx)
+            if smartart_texts:
+                text_boxes.append(TextBox(
+                    box_id=f"box_{slide_idx}_smartart_{shape_idx}",
+                    shape_type="smartart",
+                    slide_index=slide_idx,
+                    shape_index=shape_idx,
+                    runs=smartart_texts,
+                    constraints=get_spatial_constraints(shape),
+                ))
         return text_boxes
     
     # Regular shapes with text frames
@@ -271,14 +397,17 @@ def extract_from_shape(
     
     if runs:
         constraints = get_spatial_constraints(shape)
-        text_boxes.append(TextBox(
-            box_id=f"box_{slide_idx}_{shape_idx}",
+        global _box_counter
+        tb = TextBox(
+            box_id=f"box_{slide_idx}_{_box_counter}",
             shape_type="shape",
             slide_index=slide_idx,
             shape_index=shape_idx,
             runs=runs,
             constraints=constraints,
-        ))
+        )
+        _box_counter += 1
+        text_boxes.append(tb)
     
     return text_boxes
 
@@ -287,11 +416,12 @@ def extract_slide(pptx: Presentation, slide_idx: int) -> Slide:
     """Extract all text from a single slide."""
     slide = pptx.slides[slide_idx]
     slide_id = slide.slide_id
+    slide_part = slide.part  # For accessing relationships (SmartArt, etc.)
     
     text_boxes = []
     
     for shape_idx, shape in enumerate(slide.shapes):
-        text_boxes.extend(extract_from_shape(shape, slide_idx, shape_idx))
+        text_boxes.extend(extract_from_shape(shape, slide_idx, shape_idx, slide_part))
     
     # Calculate total runs
     total_runs = sum(len(tb.runs) for tb in text_boxes)

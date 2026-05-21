@@ -143,15 +143,14 @@ class TranslationMemory:
         if not relevant:
             return ""
         
-        # Build context prompt
+        # Build context prompt — use '=' instead of '→' so Gemini doesn't mimic the format
         examples = "\n".join([
-            f"- {e.source_text} → {e.translated_text}"
-            for e in relevant[:20]  # Limit to top 20
+            f"  {e.source_text} = {e.translated_text}"
+            for e in relevant[:20]
         ])
         
-        return f"""For consistent terminology, translate these common terms as shown:
+        return f"""Use this glossary for consistent terminology (only as reference, do NOT include these in output):
 {examples}
-
 """
     
     def clear(self):

@@ -22,6 +22,7 @@ from app.models import (
     TranslationRequest,
     TranslationJob,
     TranslatedRun,
+    ExportRequest,
 )
 
 
@@ -54,7 +55,72 @@ translation_service = TranslationService(settings)
 # Translation memory
 tm = get_translation_memory()
 
-# In-memory job storage (use Redis in production)
+def sanitize_translation(text: str, original: str) -> str:
+    """
+    Sanitize translation output by removing contamination like:
+    - Arrow notation (→) from glossary patterns
+    - Duplicate original text
+    - Metadata labels like "Translation:" or "Text:"
+    """
+    result = text.strip()
+    
+    # 1. Remove leading labels like "Translation:" or "Translated text:"
+    for label in ['Translation:', 'Translated text:', 'Output:', 'Result:', 'Translated:']:
+        if label in result:
+            # Take everything after the LAST occurrence of the label
+            result = result.split(label)[-1].strip()
+    
+    # 2. If the result contains "original → translation" or "original = translation" pattern
+    # where original matches the source text, extract just the translation side
+    for sep in [' → ', ' = ']:
+        if sep in result and original in result:
+            # Split by lines and find the line with the match
+            lines = result.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                line = line.strip()
+                if sep in line and original in line:
+                    # Extract the part after the separator
+                    parts = line.split(sep)
+                    line = parts[-1].strip()
+                cleaned_lines.append(line)
+            result = '\n'.join(cleaned_lines)
+    
+    # 3. If result starts with the original text verbatim, try to extract just the translation
+    if result.startswith(original) and len(result) > len(original) + 2:
+        remainder = result[len(original):].strip()
+        # Check if remainder is separated by →, =, : or just whitespace
+        if remainder.startswith('→') or remainder.startswith('='):
+            remainder = remainder[1:].strip()
+        if remainder:  # Only use if there's something after the original
+            result = remainder
+    
+    # 4. Remove any "KEYWORD → KEYWORD" patterns (duplicate word on both sides)
+    import re
+    result = re.sub(r'\b(\w+)\s*[→=]\s*\1\b', r'\1', result)
+    
+    # 5. If result contains the phrase "Context:" or "CRITICAL:" or "glossary", strip it all out
+    for poison in ['Context:', 'CRITICAL:', 'glossary', 'Translate the following', 'Text to translate']:
+        if poison in result:
+            # Take everything before the poison word (it's usually at the start)
+            result = result.split(poison)[0].strip()
+    
+    # 6. Final cleanup
+    result = result.strip()
+    result = result.strip('"\'')
+    result = result.strip()
+    
+    return result if result else original
+
+
+def sanitize_translated_runs(translated_runs: list[TranslatedRun]) -> list[TranslatedRun]:
+    """Sanitize all translated runs to remove contamination."""
+    for tr in translated_runs:
+        cleaned = sanitize_translation(tr.translated_text, tr.original_text)
+        if cleaned != tr.translated_text:
+            print(f"  [SANITIZE] Run {tr.run_id}: stripped contamination: {tr.translated_text[:50]} → {cleaned[:50]}")
+        tr.translated_text = cleaned
+    return translated_runs
 jobs: dict[str, TranslationJob] = {}
 
 
@@ -146,6 +212,11 @@ async def upload_pptx(file: UploadFile = File(...)):
                                 "run_id": r.run_id,
                                 "text": r.text,
                                 "style": r.style.model_dump(),
+                                "slide_index": r.slide_index,
+                                "shape_index": r.shape_index,
+                                "paragraph_index": r.paragraph_index,
+                                "run_index": r.run_index,
+                                "xml_path": r.xml_path,
                             }
                             for r in tb.runs
                         ],
@@ -180,68 +251,101 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
     
     The translation is processed in the background for large files.
     """
-    job_id = str(uuid.uuid4())
+    # Use provided job_id (from upload) or create a new one
+    job_id = request.job_id or str(uuid.uuid4())
     
-    # Initialize job
-    jobs[job_id] = TranslationJob(
-        job_id=job_id,
-        filename="",
-        status="processing",
-        total_runs=len(request.runs),
-        translated_runs=[],
-        progress=0.0,
-    )
+    # Initialize or update job
+    if job_id in jobs:
+        jobs[job_id].status = "processing"
+        jobs[job_id].total_runs = len(request.runs)
+        jobs[job_id].progress = 0.0
+    else:
+        jobs[job_id] = TranslationJob(
+            job_id=job_id,
+            filename="",
+            status="processing",
+            total_runs=len(request.runs),
+            translated_runs=[],
+            progress=0.0,
+        )
     
-    # Process translations
+    # Process translations in batch with concurrency
     translated_runs = []
     tm = get_translation_memory()
     
-    # Build context from translation memory
-    context = tm.build_context_prompt(request.source_language, request.target_language)
-    
-    for i, run in enumerate(request.runs):
-        # Check cache first
-        cached = tm.get(run.text, request.source_language, request.target_language)
-        
-        if cached:
-            translated_text = cached
-            model_used = "cache"
-            success = True
+    # Build context from translation memory + user custom context
+    glossary_context = tm.build_context_prompt(request.source_language, request.target_language)
+    if request.context:
+        if glossary_context:
+            context = f"{request.context.strip()}\n\nAlso use this terminology:\n{glossary_context}"
         else:
-            # Translate
-            translated_text, model_used, success = await translation_service.translate_text(
-                text=run.text,
-                source_lang=request.source_language,
-                target_lang=request.target_language,
-                model=request.model,
-                context=context,
-            )
-            
-            # Cache the translation
+            context = request.context.strip()
+    else:
+        context = glossary_context
+    
+    # Prepare texts for batch translation
+    texts_to_translate = [(run.run_id, run.text) for run in request.runs]
+    
+    # Check cache first and collect uncached texts
+    uncached = []
+    for run_id, text in texts_to_translate:
+        cached = tm.get(text, request.source_language, request.target_language)
+        if cached:
+            cleaned = sanitize_translation(cached, text)
+            if cleaned != cached:
+                print(f"  [SANITIZE] Cache hit for run {run_id}: stripped contamination")
+            translated_runs.append(TranslatedRun(
+                run_id=run_id,
+                original_text=text,
+                translated_text=cleaned,
+                source_language=request.source_language,
+                target_language=request.target_language,
+                model_used="cache",
+            ))
+        else:
+            uncached.append((run_id, text))
+    
+    # Translate uncached texts in batch with concurrency
+    if uncached:
+        uncached_texts = [t[1] for t in uncached]
+        batch_results = await translation_service.batch_translate(
+            texts=uncached_texts,
+            source_lang=request.source_language,
+            target_lang=request.target_language,
+            model=request.model,
+            context=context,
+            concurrency=5,
+        )
+        
+        for (run_id, text), (translated_text, model_used, success) in zip(uncached, batch_results):
+            # Cache successful translations
             if success:
                 tm.set(
-                    text=run.text,
+                    text=text,
                     translated_text=translated_text,
                     source_lang=request.source_language,
                     target_lang=request.target_language,
                     model_used=model_used,
                 )
-        
-        # Create translated run
-        translated_run = TranslatedRun(
-            run_id=run.run_id,
-            original_text=run.text,
-            translated_text=translated_text,
-            source_language=request.source_language,
-            target_language=request.target_language,
-            model_used=model_used,
-        )
-        
-        translated_runs.append(translated_run)
-        
-        # Update progress
-        jobs[job_id].translated_runs.append(translated_run)
-        jobs[job_id].progress = (i + 1) / len(request.runs) * 100
+            
+            translated_runs.append(TranslatedRun(
+                run_id=run_id,
+                original_text=text,
+                translated_text=translated_text,
+                source_language=request.source_language,
+                target_language=request.target_language,
+                model_used=model_used,
+            ))
+    
+    # Sort by run_id to maintain original order
+    translated_runs.sort(key=lambda tr: tr.run_id)
+    
+    # Sanitize all translations to strip contamination
+    translated_runs = sanitize_translated_runs(translated_runs)
+    
+    # Update job progress
+    jobs[job_id].translated_runs = translated_runs
+    jobs[job_id].progress = 100.0
     
     # Mark job as completed
     jobs[job_id].status = "completed"
@@ -266,7 +370,7 @@ async def get_job(job_id: str):
 
 
 @app.post("/api/export")
-async def export_pptx(request: ExportResponse):
+async def export_pptx(request: ExportRequest):
     """
     Export translated PPTX file.
     
@@ -340,11 +444,15 @@ async def health_check():
         "status": "healthy",
         "version": "1.0.0",
         "settings": {
+            "gemini_configured": bool(settings.gemini_api_key),
+            "google_cloud_configured": bool(settings.google_cloud_api_key),
+            "opencode_configured": bool(settings.opencode_api_key),
             "glm_configured": bool(settings.glm_api_key),
             "kimi_configured": bool(settings.kimi_api_key),
             "minimax_configured": bool(settings.minimax_api_key),
             "qwen_configured": bool(settings.qwen_api_key),
             "ollama_configured": bool(settings.ollama_url),
+            "default_model": settings.default_model,
         },
     }
 
@@ -352,4 +460,4 @@ async def health_check():
 # Run with: uvicorn app.main:app --reload --port 8000
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

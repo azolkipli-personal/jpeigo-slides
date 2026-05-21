@@ -27,5 +27,5 @@ if [ ! -f ".env" ]; then
 fi
 
 # Start the server
-echo "Starting FastAPI server on port 8000..."
-uvicorn app.main:app --reload --port8000 --host 0.0.0.0
+echo "Starting FastAPI server on port 8002..."
+uvicorn app.main:app --reload --port 8002 --host 0.0.0.0

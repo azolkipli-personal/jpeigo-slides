@@ -1,7 +1,7 @@
 """
 PPTX Translator - Backend Configuration
 """
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 from functools import lru_cache
 
@@ -9,16 +9,21 @@ from functools import lru_cache
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
+    model_config = SettingsConfigDict(extra='ignore', env_file=".env")
+    
     # Server settings
     app_name: str = "PPTX Translator"
     debug: bool = False
-    cors_origins: list[str] = ["http://localhost:3000"]
+    cors_origins: list[str] = ["http://localhost:3002"]
     
     # File upload settings
     max_file_size: int = 50 * 1024 * 1024  # 50MB
     upload_dir: str = "uploads"
     output_dir: str = "outputs"
-    
+
+    # Default model
+    default_model: str = "gemini"
+
     # Translation API settings
     glm_api_key: Optional[str] = None
     glm_api_url: str = "https://open.bigmodel.cn/api/paas/v4"
@@ -51,10 +56,6 @@ class Settings(BaseSettings):
     translation_cache_ttl: int = 86400  # 24 hours
     use_redis: bool = False
     redis_url: str = "redis://localhost:6379"
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
 
 @lru_cache()
