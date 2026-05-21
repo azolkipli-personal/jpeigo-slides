@@ -91,9 +91,9 @@ jobs:
       - name: Prepare distribution zip
         run: |
           New-Item -ItemType Directory -Path dist_folder -Force
-          New-Item -ItemType Directory -Path dist_folder\backend -Force
           Copy-Item -Path backend\dist\jpeigo-slides.exe -Destination dist_folder\
-          Copy-Item -Path backend\.env.example -Destination dist_folder\backend\
+          Copy-Item -Path backend\.env.example -Destination dist_folder\.env.example
+          Copy-Item -Path ..\README.md -Destination dist_folder\README.md -ErrorAction SilentlyContinue
           Compress-Archive -Path dist_folder\* -DestinationPath jpeigo-slides-portable.zip
         shell: pwsh
 
