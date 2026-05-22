@@ -447,7 +447,15 @@ export default function NewTranslatorPage() {
                       {/* Current slide image */}
                       <div className="bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
                         <div className="bg-gray-100 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
+                          <button onClick={() => setCurrentSlide(p => Math.max(0, p - 1))} disabled={currentSlide === 0}
+                            className="px-3 py-1 rounded text-sm text-gray-600 hover:bg-gray-200 disabled:text-gray-300 disabled:hover:bg-transparent transition-colors">
+                            ← {text.previous}
+                          </button>
                           <span className="text-sm font-medium text-gray-700">{text.slideLabel} {currentSlide + 1} / {previewImages.length}</span>
+                          <button onClick={() => setCurrentSlide(p => Math.min(previewImages.length - 1, p + 1))} disabled={currentSlide === previewImages.length - 1}
+                            className="px-3 py-1 rounded text-sm text-gray-600 hover:bg-gray-200 disabled:text-gray-300 disabled:hover:bg-transparent transition-colors">
+                            {text.next} →
+                          </button>
                         </div>
                         <div className="p-4 flex justify-center">
                           {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -490,17 +498,6 @@ export default function NewTranslatorPage() {
                           </div>
                         )}
 
-                        {/* Navigation */}
-                        <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200 bg-gray-50/50">
-                          <button onClick={() => setCurrentSlide(p => Math.max(0, p - 1))} disabled={currentSlide === 0}
-                            className="px-4 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-200 disabled:text-gray-300 disabled:hover:bg-transparent transition-colors">
-                            ← {text.previous}
-                          </button>
-                          <button onClick={() => setCurrentSlide(p => Math.min(previewImages.length - 1, p + 1))} disabled={currentSlide === previewImages.length - 1}
-                            className="px-4 py-1.5 rounded-lg text-sm text-gray-600 hover:bg-gray-200 disabled:text-gray-300 disabled:hover:bg-transparent transition-colors">
-                            {text.next} →
-                          </button>
-                        </div>
                       </div>
                     </div>
                   )}
