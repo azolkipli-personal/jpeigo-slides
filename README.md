@@ -269,6 +269,37 @@ npm test
 
 ---
 
+## FAQ
+
+### Getting "HTTP 429 — monthly spending cap reached" with Gemini?
+
+This happens on **free tier** accounts when using newer Gemini models (3.x series). Google's free tier enforces strict spending caps, and the newer models are more expensive per request — so they hit the cap almost immediately.
+
+**Fix:** Switch to `gemini-25-flash-lite` in the model selector. Gemini 2.5 Flash Lite stays well within free tier limits.
+
+### Which Gemini model should I use?
+
+| Your account | Recommended model |
+|---|---|
+| Free tier (AI Studio) | `gemini-25-flash-lite` |
+| Paid tier / billing enabled | `gemini-pro`, `gemini-flash`, `gemini-flash-lite` |
+
+### How do I upgrade to paid tier?
+
+1. Go to [Google AI Studio](https://aistudio.google.com/)
+2. Navigate to **Settings → Billing**
+3. Enable billing and increase your spending cap
+4. Once enabled, you can use the 3.x models without issues
+
+### How do I switch models?
+
+In the translator UI, use the model dropdown before clicking Translate. Or set the default in `backend/.env`:
+```env
+DEFAULT_MODEL=gemini-25-flash-lite
+```
+
+---
+
 ## License
 
 MIT
