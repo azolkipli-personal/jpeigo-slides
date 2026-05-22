@@ -171,10 +171,13 @@ All configuration is done via environment variables in `backend/.env`.
 ### Supported Models
 
 **Gemini (Google):**
-- `gemini-pro` — Gemini 3 Pro
-- `gemini-flash` — Gemini 3.5 Flash
-- `gemini-flash-lite` — Gemini 3.1 Flash Lite (fast, free tier)
-- `gemini-25-flash-lite` — Gemini 2.5 Flash Lite
+
+> ⚠️ **Free tier:** Use `gemini-25-flash-lite`. Newer Gemini models (3.x like 3.5 Flash and 3.1 Flash Lite) trigger HTTP 429 "monthly spending cap reached" on free tier accounts. Paid tier users can use any model below.
+
+- `gemini-25-flash-lite` — Gemini 2.5 Flash Lite ✅ **recommended for free tier**
+- `gemini-pro` — Gemini 3 Pro (paid tier)
+- `gemini-flash` — Gemini 3.5 Flash (paid tier)
+- `gemini-flash-lite` — Gemini 3.1 Flash Lite (paid tier)
 
 **OpenCode (unified API):**
 - `opencode-deepseek` — DeepSeek V4
