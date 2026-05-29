@@ -25,6 +25,16 @@ from app.models import (
     ExportRequest,
 )
 
+# Google Slides integration
+from app.google_slides.oauth import (
+    get_auth_url, handle_callback, is_authenticated, clear_credentials
+)
+from app.google_slides.service import (
+    list_presentations, extract_slide_text,
+    flatten_runs_for_translation, build_translated_runs_from_result,
+    create_translated_presentation,
+)
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -455,6 +465,236 @@ async def health_check():
             "default_model": settings.default_model,
         },
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Google Slides Native Integration
+# ──────────────────────────────────────────────────────────────────────
+
+
+class SlidesAuthUrlResponse(BaseModel):
+    url: str
+
+
+class SlidesAuthCallbackRequest(BaseModel):
+    code: str
+
+
+class SlidesAuthStatusResponse(BaseModel):
+    authenticated: bool
+
+
+class SlidesPresentationListResponse(BaseModel):
+    presentations: list[dict]
+
+
+class SlidesExtractResponse(BaseModel):
+    presentation_id: str
+    title: str
+    total_slides: int
+    total_runs: int
+    slides: list[dict]
+    runs: list[dict]
+
+
+class SlidesTranslateRequest(BaseModel):
+    presentation_id: str
+    source_language: str = "ja"
+    target_language: str = "en"
+    model: str = "gemini-flash-lite"
+    context: Optional[str] = None
+    new_title: Optional[str] = None
+
+
+class SlidesTranslateResponse(BaseModel):
+    new_presentation_id: str
+    new_title: str
+    new_url: str
+    total_runs: int
+    translated_runs: int
+    model_used: str
+
+
+@app.get("/api/slides/auth/url", response_model=SlidesAuthUrlResponse)
+async def slides_get_auth_url():
+    """
+    Get the Google OAuth authorization URL.
+    Redirect the user's browser to this URL.
+    """
+    try:
+        url = get_auth_url()
+        return SlidesAuthUrlResponse(url=url)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/slides/auth/callback", response_model=SlidesAuthStatusResponse)
+async def slides_auth_callback(request: SlidesAuthCallbackRequest):
+    """
+    Handle the OAuth callback from Google.
+    Exchange the authorization code for tokens.
+    """
+    try:
+        result = handle_callback(request.code)
+        return SlidesAuthStatusResponse(authenticated=result["authenticated"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Auth failed: {str(e)}")
+
+
+@app.get("/api/slides/auth/status", response_model=SlidesAuthStatusResponse)
+async def slides_auth_status():
+    """Check if we have valid Google credentials."""
+    return SlidesAuthStatusResponse(authenticated=is_authenticated())
+
+
+@app.post("/api/slides/auth/logout")
+async def slides_auth_logout():
+    """Clear stored credentials (logout)."""
+    clear_credentials()
+    return {"status": "logged_out"}
+
+
+@app.get("/api/slides/presentations", response_model=SlidesPresentationListResponse)
+async def slides_list_presentations():
+    """List Google Slides presentations from Drive."""
+    try:
+        presentations = list_presentations()
+        return SlidesPresentationListResponse(presentations=presentations)
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/slides/read/{presentation_id}", response_model=SlidesExtractResponse)
+async def slides_read_presentation(presentation_id: str):
+    """
+    Extract all text runs from a Google Slides presentation.
+    Returns the text content organized by slide, ready for translation.
+    """
+    try:
+        pres_data = extract_slide_text(presentation_id)
+        runs = flatten_runs_for_translation(pres_data)
+        
+        slides_json = []
+        for slide in pres_data.slides:
+            slide_runs = [
+                r for r in runs
+                if r.get("_slides_meta", {}).get("slide_object_id") == slide.slide_object_id
+            ]
+            slides_json.append({
+                "slide_index": slide.slide_index,
+                "slide_object_id": slide.slide_object_id,
+                "text_boxes": [
+                    {
+                        "page_element_id": tb.page_element_id,
+                        "shape_type": tb.shape_type,
+                        "runs": [
+                            r for r in slide_runs
+                            if r.get("_slides_meta", {}).get("page_element_id") == tb.page_element_id
+                        ],
+                    }
+                    for tb in slide.text_boxes
+                ],
+            })
+        
+        return SlidesExtractResponse(
+            presentation_id=pres_data.presentation_id,
+            title=pres_data.title,
+            total_slides=len(pres_data.slides),
+            total_runs=len(runs),
+            slides=slides_json,
+            runs=runs,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/slides/translate", response_model=SlidesTranslateResponse)
+async def slides_translate(request: SlidesTranslateRequest):
+    """
+    Translate a Google Slides presentation end-to-end:
+      1. Read the presentation text
+      2. Translate all text runs
+      3. Create a new translated presentation copy
+      4. Return the new presentation URL
+    """
+    try:
+        # 1. Extract text from the original presentation
+        pres_data = extract_slide_text(request.presentation_id)
+        original_runs = flatten_runs_for_translation(pres_data)
+        
+        if not original_runs:
+            raise HTTPException(
+                status_code=400,
+                detail="No text runs found in this presentation"
+            )
+        
+        # 2. Translate using existing translation service (batched)
+        texts_to_translate = [run["text"] for run in original_runs]
+        
+        batch_results = await translation_service.batch_translate(
+            texts=texts_to_translate,
+            source_lang=request.source_language,
+            target_lang=request.target_language,
+            model=request.model,
+            context=request.context,
+        )
+        # batch_results: [(translated_text, model_used, success), ...]
+        
+        # 3. Build translated runs matching original structure
+        translated = []
+        model_used = request.model
+        for i, (orig_run, (translated_text, used_model, success)) in enumerate(
+            zip(original_runs, batch_results)
+        ):
+            model_used = used_model
+            translated.append({
+                "run_id": orig_run["run_id"],
+                "original_text": orig_run["text"],
+                "translated_text": translated_text if success else orig_run["text"],
+                "source_language": request.source_language,
+                "target_language": request.target_language,
+                "model_used": used_model,
+            })
+        
+        if not translated:
+            raise HTTPException(
+                status_code=500,
+                detail="Translation produced no results"
+            )
+        
+        # 3. Build batch update data for Google Slides
+        slide_batch = build_translated_runs_from_result(original_runs, translated)
+        
+        # 4. Create the translated presentation
+        result = create_translated_presentation(
+            source_presentation_id=request.presentation_id,
+            translated_runs=slide_batch,
+            new_title=request.new_title,
+        )
+        
+        return SlidesTranslateResponse(
+            new_presentation_id=result["id"],
+            new_title=result["title"],
+            new_url=result["url"],
+            total_runs=len(original_runs),
+            translated_runs=sum(
+                1 for t in slide_batch if t["translated_text"] != t["original_text"]
+            ),
+            model_used=model_used,
+        )
+        
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
 
 # Run with: uvicorn app.main:app --reload --port 8000

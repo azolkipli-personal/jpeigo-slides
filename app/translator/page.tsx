@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import SlidesPanel from '@/components/SlidesPanel';
 
 // --- Types ---
 interface TextRun { run_id: string; text: string; style: { font_size: number | null; font_color: string | null; font_name: string | null; bold: boolean; italic: boolean; underline: boolean; }; }
@@ -78,6 +79,7 @@ const t = (ui: UI) => ui === 'en' ? en : ja;
 
 export default function NewTranslatorPage() {
   const [ui, setUi] = useState<UI>('en');
+  const [mode, setMode] = useState<'pptx' | 'slides'>('pptx');
   const text = t(ui);
 
   const [document, setDocument] = useState<UploadedDocument | null>(null);
@@ -227,6 +229,17 @@ export default function NewTranslatorPage() {
             <span className="text-sm font-medium text-gray-700 select-none">{text.title}</span>
           </div>
           <div className="flex items-center gap-4 text-sm">
+            {/* Mode Toggle: PPTX vs Google Slides */}
+            <div className="flex items-center bg-gray-100 rounded-lg p-0.5">
+              <button onClick={() => { setMode('pptx'); resetAll(); }} className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${mode === 'pptx' ? 'bg-white text-gray-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" className="inline-block mr-1 -mt-0.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                PPTX
+              </button>
+              <button onClick={() => { setMode('slides'); resetAll(); }} className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${mode === 'slides' ? 'bg-white text-gray-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" className="inline-block mr-1 -mt-0.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                Slides
+              </button>
+            </div>
             {/* EN/JP Toggle */}
             <div className="flex items-center bg-gray-100 rounded-lg p-0.5">
               <button onClick={() => setUi('en')} className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${ui === 'en' ? 'bg-white text-gray-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>EN</button>
@@ -253,8 +266,8 @@ export default function NewTranslatorPage() {
             <div className="mb-6 px-4 py-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">{error}</div>
           )}
 
-          {/* === Upload State === */}
-          {!document && !loading && (
+          {/* === Upload State (PPTX mode) === */}
+          {mode === 'pptx' && !document && !loading && (
             <div className="max-w-xl mx-auto mt-12">
               <div className="text-center mb-8">
                 <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-50 mb-4">
@@ -287,6 +300,17 @@ export default function NewTranslatorPage() {
                 <p className="text-xs text-gray-400">{text.uploadHint}</p>
               </div>
             </div>
+          )}
+
+          {/* === Google Slides Mode === */}
+          {mode === 'slides' && !document && !loading && (
+            <SlidesPanel
+              ui={ui}
+              sourceLang={sourceLang}
+              targetLang={targetLang}
+              model={model}
+              contextPrompt={contextPrompt}
+            />
           )}
 
           {/* === Upload Progress === */}

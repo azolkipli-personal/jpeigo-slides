@@ -42,6 +42,10 @@ backend/.translation_cache/
 backend/venv/
 backend/test_*.pptx
 
+# Google Slides OAuth tokens (do not commit)
+backend/.slides_token.json
+backend/client_secret.json
+
 # env files (can opt-in for committing if needed)
 .env*
 

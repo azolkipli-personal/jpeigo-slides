@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     # Ollama settings (for local models)
     ollama_url: Optional[str] = None  # e.g., "http://localhost:11434"
     
+    # Google Slides OAuth
+    google_slides_redirect_uri: str = "http://localhost:3002/api/slides/auth/callback"
+    
     # Translation memory
     translation_cache_ttl: int = 86400  # 24 hours
     use_redis: bool = False
