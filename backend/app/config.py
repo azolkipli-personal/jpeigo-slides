@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3002"]
     
     # File upload settings
-    max_file_size: int = 50 * 1024 * 1024  # 50MB
+    max_file_size: int = 100 * 1024 * 1024  # 100MB
     upload_dir: str = "uploads"
     output_dir: str = "outputs"
 

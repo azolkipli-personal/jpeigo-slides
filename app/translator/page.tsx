@@ -18,7 +18,7 @@ const en = {
   subtitle: 'Translate PowerPoint slides',
   desc: 'Upload a .pptx file to extract and translate text while preserving formatting.',
   uploadPrompt: 'Drag a file here or click to browse',
-  uploadHint: '.pptx files up to 50MB',
+  uploadHint: '.pptx files up to 100MB',
   extracting: 'Extracting text from PowerPoint...',
   from: 'From', to: 'To',
   model: 'Translation model',
@@ -49,7 +49,7 @@ const ja: typeof en = {
   subtitle: 'PowerPointスライドを翻訳',
   desc: 'pptxファイルをアップロードして、テキストを抽出・翻訳。フォーマットはそのまま保持します。',
   uploadPrompt: 'ファイルをドラッグ＆ドロップ、またはクリックして選択',
-  uploadHint: '.pptx ファイル（50MBまで）',
+  uploadHint: '.pptx ファイル（100MBまで）',
   extracting: 'PowerPointからテキストを抽出中...',
   from: '翻訳元', to: '翻訳先',
   model: '翻訳モデル',
@@ -267,7 +267,7 @@ export default function NewTranslatorPage() {
           )}
 
           {/* === Upload State (PPTX mode) === */}
-          {mode === 'pptx' && !document && !loading && (
+          {mode === 'pptx' && !document && !loading && !error && (
             <div className="max-w-xl mx-auto mt-12">
               <div className="text-center mb-8">
                 <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-50 mb-4">
