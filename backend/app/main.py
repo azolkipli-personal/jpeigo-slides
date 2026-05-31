@@ -1,7 +1,7 @@
 """
 FastAPI endpoints for PPTX translation.
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -110,8 +110,15 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 
-async def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    """Dependency to verify API key on protected endpoints."""
+async def verify_api_key(request: Request, x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    """Dependency to verify API key on protected endpoints.
+
+    Requests from localhost are always trusted (backend is bound to 127.0.0.1).
+    External requests require X-API-Key header if API_KEY is configured.
+    """
+    # Requests from localhost are always trusted (backend is bound to 127.0.0.1)
+    if request.client and request.client.host in ("127.0.0.1", "::1", "localhost"):
+        return x_api_key
     if settings.api_key:
         if not x_api_key:
             raise HTTPException(status_code=401, detail="API key required. Set X-API-Key header.")
