@@ -39,15 +39,15 @@ Translating PowerPoint presentations is genuinely painful. The standard approach
 ## Architecture
 
 ```
-┌──────────────────┐     ┌───────────────────┐
-│  Next.js Frontend │────▶│  Python FastAPI    │
+┌───────────────────┐      ┌─────────────────────┐
+│  Next.js Frontend │────▶│  Python FastAPI     │
 │  (port 3002)      │◀────│  Backend (port 8002)│
-│                   │     │                    │
-│  - Upload UI      │     │  - PPTX extraction │
-│  - Translation UI │     │  - PPTX injection  │
-│  - Slide preview  │     │  - Translation API │
-│  - Edit/Export    │     │  - Translation mem  │
-└──────────────────┘     └───────────────────┘
+│                   │      │                     │
+│  - Upload UI      │      │  - PPTX extraction  │
+│  - Translation UI │      │  - PPTX injection   │
+│  - Slide preview  │      │  - Translation API  │
+│  - Edit/Export    │      │  - Translation mem  │
+└───────────────────┘      └─────────────────────┘
 ```
 
 The Next.js frontend proxies API calls to the Python backend. The backend does all the heavy lifting — parsing the `.pptx` ZIP structure, extracting XML text runs, calling translation APIs, and re-injecting translated text into the XML.
