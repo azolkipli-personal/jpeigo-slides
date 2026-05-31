@@ -1,7 +1,7 @@
 """
 FastAPI endpoints for PPTX translation.
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -9,8 +9,10 @@ from typing import Optional
 import uuid
 import os
 import asyncio
+from datetime import datetime, timedelta
 from pathlib import Path
 import shutil
+from contextlib import asynccontextmanager
 
 from app.config import Settings, get_settings
 from app.core.extractor import extract_pptx
@@ -64,6 +66,60 @@ translation_service = TranslationService(settings)
 
 # Translation memory
 tm = get_translation_memory()
+
+
+CLEANUP_INTERVAL = 3600  # Run cleanup every hour
+
+
+def cleanup_old_files():
+    """Delete uploaded and output files older than 24 hours."""
+    cutoff = datetime.now() - timedelta(hours=24)
+    for dir_path in [Path(settings.upload_dir), Path(settings.output_dir)]:
+        if not dir_path.exists():
+            continue
+        for item in dir_path.iterdir():
+            if item.is_file():
+                mtime = datetime.fromtimestamp(item.stat().st_mtime)
+                if mtime < cutoff:
+                    item.unlink()
+                    print(f"  [CLEANUP] Deleted old file: {item}")
+
+
+async def run_cleanup_periodically():
+    """Run cleanup_old_files every CLEANUP_INTERVAL seconds."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        try:
+            cleanup_old_files()
+        except Exception as e:
+            print(f"  [CLEANUP] Error during cleanup: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start and stop background cleanup task with the app."""
+    cleanup_task = asyncio.create_task(run_cleanup_periodically())
+    yield
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+
+app.router.lifespan_context = lifespan
+
+
+async def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    """Dependency to verify API key on protected endpoints."""
+    if settings.api_key:
+        if not x_api_key:
+            raise HTTPException(status_code=401, detail="API key required. Set X-API-Key header.")
+        if x_api_key != settings.api_key:
+            raise HTTPException(status_code=403, detail="Invalid API key.")
+    # If no api_key is configured, allow unrestricted access.
+    return x_api_key
+
 
 def sanitize_translation(text: str, original: str) -> str:
     """
@@ -433,14 +489,14 @@ async def export_pptx(request: ExportRequest):
 
 
 @app.get("/api/cache")
-async def get_translation_cache():
+async def get_translation_cache(_auth: str = Depends(verify_api_key)):
     """Get cached translations."""
     tm = get_translation_memory()
     return tm.export()
 
 
 @app.delete("/api/cache")
-async def clear_translation_cache():
+async def clear_translation_cache(_auth: str = Depends(verify_api_key)):
     """Clear translation memory."""
     tm = get_translation_memory()
     tm.clear()
@@ -448,7 +504,7 @@ async def clear_translation_cache():
 
 
 @app.get("/api/health")
-async def health_check():
+async def health_check(_auth: str = Depends(verify_api_key)):
     """Health check endpoint."""
     return {
         "status": "healthy",
@@ -700,4 +756,4 @@ async def slides_translate(request: SlidesTranslateRequest):
 # Run with: uvicorn app.main:app --reload --port 8000
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="127.0.0.1", port=8002)

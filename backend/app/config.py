@@ -55,10 +55,13 @@ class Settings(BaseSettings):
     # Google Slides OAuth
     google_slides_redirect_uri: str = "http://localhost:3002/api/slides/auth/callback"
     
+    # API security
+    api_key: Optional[str] = None  # If set, protects /api/cache and /api/health
+
     # Translation memory
     translation_cache_ttl: int = 86400  # 24 hours
     use_redis: bool = False
-    redis_url: str = "redis://localhost:6379"
+    redis_url: str = "redis://localhost:6379/0"
 
 
 @lru_cache()

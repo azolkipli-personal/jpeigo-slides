@@ -28,4 +28,4 @@ fi
 
 # Start the server
 echo "Starting FastAPI server on port 8002..."
-uvicorn app.main:app --reload --port 8002 --host 0.0.0.0
+uvicorn app.main:app --reload --port 8002 --host 127.0.0.1

@@ -150,8 +150,8 @@ powerpoint-translator/
 | `/api/upload` | POST | Upload PPTX, extract text runs |
 | `/api/translate` | POST | Translate extracted text |
 | `/api/export` | POST | Export translated PPTX |
-| `/api/health` | GET | Health check |
-| `/api/cache` | GET/DELETE | Translation memory |
+| `/api/health` | GET | Health check (requires `X-API-Key` header if `API_KEY` is set) |
+| `/api/cache` | GET/DELETE | Translation memory (requires `X-API-Key` header if `API_KEY` is set) |
 
 ### Frontend (Next.js - Port 3000)
 

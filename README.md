@@ -106,7 +106,7 @@ See [Configuration](#configuration) below for all available options.
 ```bash
 cd backend
 source venv/bin/activate
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8002
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8002
 ```
 
 Or use the convenience script:
@@ -149,6 +149,7 @@ All configuration is done via environment variables in `backend/.env`.
 | `CORS_ORIGINS` | `["http://localhost:3002"]` | Allowed CORS origins |
 | `DEFAULT_MODEL` | `gemini` | Default translation model |
 | `DEBUG` | `false` | Enable debug mode |
+| `API_KEY` | *(none)* | If set, protects `/api/cache` and `/api/health` with `X-API-Key` header auth |
 
 ### Advanced
 
