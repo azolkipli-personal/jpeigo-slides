@@ -3,6 +3,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import SlidesPanel from '@/components/SlidesPanel';
 import ThemeToggle from '@/components/ThemeToggle';
+import { APP_VERSION } from '@/lib/version';
 
 // --- Types ---
 interface TextRun { run_id: string; text: string; style: { font_size: number | null; font_color: string | null; font_name: string | null; bold: boolean; italic: boolean; underline: boolean; }; merged_span?: [number, number] | null; }
@@ -1074,7 +1075,12 @@ export default function NewTranslatorPage() {
       {/* Footer */}
       <footer className="border-t border-gray-100 dark:border-zinc-800 py-4 mt-auto">
         <div className="max-w-5xl mx-auto px-6 flex items-center justify-between text-xs text-gray-400 dark:text-zinc-500">
-          <span>{text.title}</span>
+          <span>
+            {text.title}
+            {APP_VERSION && (
+              <span className="ml-2 text-gray-300 dark:text-zinc-600">{APP_VERSION}</span>
+            )}
+          </span>
           {document && <span className="text-gray-300 dark:text-zinc-600">{document.job_id}</span>}
           {!document && restoreJobId && (
             <button onClick={() => { try { localStorage.removeItem('jpeigo-last-job-id'); } catch(e){/*no-op*/} setRestoreJobId(null); }} className="text-xs text-blue-600 dark:text-blue-400 hover:underline">Dismiss previous session</button>

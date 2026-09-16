@@ -2,6 +2,7 @@
 
 import { useState, FormEvent } from 'react';
 import ThemeToggle from '@/components/ThemeToggle';
+import { APP_VERSION } from '@/lib/version';
 
 const dict = {
   en: {
@@ -113,7 +114,12 @@ export default function LoginPage() {
       </main>
 
       <footer className="border-t border-gray-100 dark:border-zinc-800 py-4 mt-auto">
-        <div className="max-w-5xl mx-auto px-6 text-xs text-gray-400 dark:text-zinc-500">PPTX Translator</div>
+        <div className="max-w-5xl mx-auto px-6 text-xs text-gray-400 dark:text-zinc-500">
+          <span>PPTX Translator</span>
+          {APP_VERSION && (
+            <span className="ml-2 text-gray-300 dark:text-zinc-600">{APP_VERSION}</span>
+          )}
+        </div>
       </footer>
     </div>
   );
