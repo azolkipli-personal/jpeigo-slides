@@ -5,6 +5,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, R
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+from app.qa import jobs as qa_jobs
+from app.qa import render as qa_render
+from app.qa import translation_review, vision_qa
 from typing import Optional
 import uuid
 import os
@@ -17,8 +21,11 @@ import shutil
 from contextlib import asynccontextmanager
 
 from app.config import Settings, get_settings
+from app.qa import client as qa_client
+from app.model_catalog import DEFAULT_VISION_MODEL, catalog_payload, is_vision_model
 from app.core.extractor import extract_pptx
 from app.core.injector import inject_translations
+from app.core.fonts import check_jp_font
 from app.translators.service import TranslationService
 from app.utils.cache import get_translation_memory
 from app.models import (
@@ -63,6 +70,14 @@ app = FastAPI(
 # Load settings
 settings = get_settings()
 
+# Font availability: the injector writes this family into every translated run and
+# the frontend renders previews through LibreOffice, which substitutes a missing
+# family silently. Report it at startup and in /api/health so a wrong typeface is
+# a visible fact rather than a preview nobody can explain.
+FONT_STATUS = check_jp_font()
+if FONT_STATUS.get('substituted'):
+    print(f"[FONTS] {FONT_STATUS['requested']} is not installed — previews will render as {FONT_STATUS['resolved']}")
+
 # Configure CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
@@ -78,6 +93,32 @@ Path(settings.output_dir).mkdir(exist_ok=True)
 
 # Translation service
 translation_service = TranslationService(settings)
+
+# Model IDs: a provider that does not know the configured model fails every
+# request and, because the failover chain then supplies another provider, the job
+# finishes with original text and success=False. That reads as a bad translation
+# rather than a bad configuration. Probe each configured model once when
+# VALIDATE_MODELS_ON_STARTUP=1; /api/health reports runtime failures either way.
+VALIDATE_MODELS_ON_STARTUP = os.environ.get('VALIDATE_MODELS_ON_STARTUP', '') not in ('', '0', 'false', 'False')
+
+
+async def probe_configured_models() -> None:
+    """Opt-in probe of every configured translation model.
+
+    Called from `lifespan`, not `@app.on_event("startup")`: this app installs its
+    own lifespan_context, which replaces the default lifespan that runs on_event
+    hooks — a startup hook here would silently never fire.
+    """
+    if not VALIDATE_MODELS_ON_STARTUP:
+        return
+    print("[MODELS] Probing every configured model (VALIDATE_MODELS_ON_STARTUP=1)…")
+    problems = await translation_service.validate_models()
+    for model, reason in problems.items():
+        print(f"[MODELS]   {model}: {reason}")
+    if problems:
+        print(f"[MODELS] {len(problems)} configured model(s) failed — jobs will fall back or keep original text")
+    else:
+        print("[MODELS] All configured models responded")
 
 # Translation memory
 tm = get_translation_memory()
@@ -134,13 +175,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"  [JOBSTORE] Startup hydration failed: {e}")
 
+    # Probe configured model IDs in the background: it spends one request per
+    # configured model, which must not hold the port closed.
+    model_probe_task = asyncio.create_task(probe_configured_models())
+
     cleanup_task = asyncio.create_task(run_cleanup_periodically())
     yield
-    cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
+    for task in (cleanup_task, model_probe_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app.router.lifespan_context = lifespan
@@ -731,6 +777,193 @@ async def clear_translation_cache(_auth: str = Depends(verify_api_key)):
     return {"status": "cleared"}
 
 
+# ── Verification passes (Layer 2 and Layer 3) ─────────────────────────────────
+
+
+@app.get("/api/models")
+async def list_models(_auth: str = Depends(verify_api_key)):
+    """The models the UI may offer, from one place.
+
+    The picker used to carry its own hardcoded list, and it had already drifted from
+    the registry behind it: it still offered "Kimi K2.5" and "DeepSeek V4" while the
+    backend was calling kimi-k3 and deepseek-v4-flash. A label that disagrees with
+    the model actually used is worse than a short list, so the page renders from
+    this endpoint and tests/test_model_catalog.py fails if the two drift again.
+    """
+    return catalog_payload()
+
+
+class QARequest(BaseModel):
+    """An opt-in review pass over a job that has already been translated."""
+    job_id: str
+    which: str = 'translated'   # translated | original
+    model: Optional[str] = None
+    max_slides: Optional[int] = None
+    limit: Optional[int] = None
+    # A full-deck check on a slow-but-accurate model outlives one HTTP request, so the
+    # caller may drive it in absolute chunks and run every chunk. Coverage is not
+    # negotiable; only the request size is.
+    first_slide: Optional[int] = None
+    last_slide: Optional[int] = None
+
+
+def _deck_path_for(job_id: str, which: str = 'translated') -> Path:
+    """Resolve the deck a pass should look at.
+
+    'translated' is what export_pptx writes and 'original' is the file the job was
+    uploaded from; having both on disk is what makes a before/after pair possible.
+    """
+    job = jobs.get(job_id) or load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
+
+    upload_dir = Path(settings.upload_dir)
+    output_dir = Path(settings.output_dir)
+    stem = Path(job.filename).stem
+
+    if which == 'original':
+        candidates = sorted(upload_dir.glob(f"{job_id}_*")) or sorted(upload_dir.glob(f"*{stem}*"))
+    else:
+        candidates = [output_dir / f"translated_{job.filename}", output_dir / job.filename]
+        candidates = [path for path in candidates if path.exists()] or sorted(output_dir.glob(f"*{stem}*"))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise HTTPException(status_code=404, detail=f"No {which} deck on disk for job {job_id}")
+
+
+def _save_qa_report(job_id: str, pass_name: str, report: dict) -> None:
+    """Attach a report to its job. Report-only: QA never fails a job."""
+    job = jobs.get(job_id)
+    if job is None:
+        return
+    job.qa_reports[pass_name] = report
+    try:
+        job_store.save(job)
+    except Exception as exc:
+        print(f"[QA] could not persist the {pass_name} report for {job_id}: {exc}")
+
+
+@app.post("/api/qa/vision")
+async def qa_vision(request: QARequest, _auth: str = Depends(verify_api_key)):
+    """Layer 2: render the deck and report layout damage per slide.
+
+    Deliberately not part of export: it costs one vision call per slide, and its
+    findings are advisory. Report-only — the deck is never touched.
+    """
+    model = _vision_model_for(request)
+    deck = _deck_path_for(request.job_id, request.which)
+    try:
+        report = await vision_qa.review_deck(deck, model=model,
+                                             max_slides=request.max_slides,
+                                             first_slide=request.first_slide,
+                                             last_slide=request.last_slide)
+    except qa_render.RenderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    report['deck_kind'] = request.which
+    report['deck_file'] = deck.name
+    _save_qa_report(request.job_id, 'vision', report)
+    return report
+
+
+def _vision_model_for(request: QARequest) -> str:
+    """The model this check will use, or the reason it cannot run at all."""
+    model = request.model or DEFAULT_VISION_MODEL
+    if not is_vision_model(model):
+        # The translation models cannot look at slides at all: the two this app used
+        # to ship, deepseek-v4-flash and minimax-m2.5, answered HTTP 400 for image
+        # content. A blind model asked about layout invents a verdict, which is worse
+        # than an error, so reject the model instead of guessing at a reading.
+        raise HTTPException(
+            status_code=400,
+            detail=f"{model} cannot read slide images; pick one from GET /api/models",
+        )
+    problem = qa_client.key_problem(model)
+    if problem:
+        raise HTTPException(status_code=503, detail=problem)
+    return model
+
+
+@app.post("/api/qa/vision/start")
+async def qa_vision_start(request: QARequest, _auth: str = Depends(verify_api_key)):
+    """Start a whole-deck slide check and return straight away; the caller polls.
+
+    A 19-slide deck is minutes of vision calls (~85 s each, three at a time), which no
+    proxy will hold open. Detaching the check also buys real progress — the user watches
+    slides land — instead of one spinner that a gateway timeout can throw away.
+    """
+    model = _vision_model_for(request)
+    deck = _deck_path_for(request.job_id, request.which)
+    if not deck.exists():
+        raise HTTPException(status_code=404,
+                            detail=f'no {request.which} deck for {request.job_id}')
+    check = qa_jobs.start(
+        request.job_id, deck, model, which=request.which,
+        on_finish=lambda report: _save_qa_report(request.job_id, 'vision', report),
+    )
+    return {'state': check.state, 'job_id': request.job_id, 'which': request.which,
+            'model': model, 'checked': 0, 'total': check.total}
+
+
+@app.get("/api/qa/vision/status")
+async def qa_vision_status(job_id: str, which: str = 'translated',
+                           _auth: str = Depends(verify_api_key)):
+    """Progress of a background slide check: running, done or failed.
+
+    Returns the report as it stands, so the UI shows findings from slides already
+    reviewed rather than nothing until the last slide finishes.
+    """
+    check = qa_jobs.get(job_id, which)
+    if check is None:
+        raise HTTPException(status_code=404,
+                            detail=f'no slide check for {job_id} ({which})')
+    return {'state': check.state, 'job_id': job_id, 'which': which, 'model': check.model,
+            'checked': check.checked, 'total': check.total, 'error': check.error,
+            'report': check.report}
+
+
+@app.post("/api/qa/review")
+async def qa_review(request: QARequest, _auth: str = Depends(verify_api_key)):
+    """Layer 3: terminology, register and leftover review of the job's units."""
+    job = jobs.get(request.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job {request.job_id}")
+    units = [{'original_text': run.original_text, 'translated_text': run.translated_text}
+             for run in job.translated_runs]
+    if request.limit:
+        units = units[:request.limit]
+    if not units:
+        raise HTTPException(status_code=400, detail="This job has no translation units to review")
+    report = await translation_review.review_units(units, model=request.model)
+    _save_qa_report(request.job_id, 'translation_review', report)
+    return report
+
+
+@app.get("/api/qa/reports/{job_id}")
+async def qa_reports(job_id: str, _auth: str = Depends(verify_api_key)):
+    """Reports already produced for a job, so the UI never has to re-run a pass."""
+    job = jobs.get(job_id) or load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
+    return job.qa_reports
+
+
+@app.get("/api/source")
+async def get_source_deck(job_id: str, _auth: str = Depends(verify_api_key)):
+    """The deck this job was uploaded from.
+
+    The preview path needs it to render the before side of a before/after pair; the
+    translated side already comes from /api/export.
+    """
+    path = _deck_path_for(job_id, 'original')
+    return FileResponse(
+        path=str(path),
+        filename=Path(path).name,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+
+
 @app.get("/api/health")
 async def health_check(_auth: str = Depends(verify_api_key)):
     """Health check endpoint."""
@@ -748,6 +981,13 @@ async def health_check(_auth: str = Depends(verify_api_key)):
             "ollama_configured": bool(settings.ollama_url),
             "default_model": settings.default_model,
         },
+        # Which font the injector writes and whether this machine can render it;
+        # fontconfig substitutes silently, so this is the only place it surfaces.
+        "jp_font": FONT_STATUS,
+        # Last failure per model name. Failover hides provider errors, and a wrong
+        # model ID looks exactly like a bad translation from the outside, so the
+        # reasons are collected here instead of only going to stdout.
+        "model_errors": translation_service.model_errors,
     }
 
 

@@ -256,3 +256,9 @@ if FAILURES:
     print(f'{len(FAILURES)} CHECK(S) FAILED: ' + ', '.join(FAILURES))
     sys.exit(1)
 print('All injector unit checks passed.')
+
+
+def test_injector_units() -> None:
+    """The module-level checks above run at import; expose their verdict to pytest so
+    `pytest tests/` cannot be green while injection is broken."""
+    assert not FAILURES, f'injector checks failed: {FAILURES}'

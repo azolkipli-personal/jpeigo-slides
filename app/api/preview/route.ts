@@ -1,7 +1,9 @@
 /**
- * API route for generating slide preview images from a translated PPTX.
+ * API route for generating slide preview images from a PPTX.
  * Converts PPTX → PDF → individual page PNGs using LibreOffice + pdftoppm.
- * Results are cached by job_id so repeated requests skip the heavy conversion.
+ * Results are cached per deck (job_id + which) so repeated requests skip the heavy
+ * conversion. Pass which: 'original' to render the deck as uploaded, 'translated'
+ * (default) to render the exported deck — that pair is the before/after view.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { execSync } from 'child_process';
@@ -39,8 +41,8 @@ function sweepCache(): void {
   } catch { /* first call or race — ignore */ }
 }
 
-function loadCachedImages(jobId: string): string[] | null {
-  const cacheDir = join(CACHE_DIR, jobId);
+function loadCachedImages(cacheKey: string): string[] | null {
+  const cacheDir = join(CACHE_DIR, cacheKey);
   if (!existsSync(cacheDir)) return null;
 
   const files = readdirSync(cacheDir)
@@ -59,9 +61,9 @@ function loadCachedImages(jobId: string): string[] | null {
   });
 }
 
-function saveToCache(jobId: string, sourceDir: string, fileNames: string[]): void {
+function saveToCache(cacheKey: string, sourceDir: string, fileNames: string[]): void {
   try {
-    const cacheDir = join(CACHE_DIR, jobId);
+    const cacheDir = join(CACHE_DIR, cacheKey);
     mkdirSync(cacheDir, { recursive: true });
     for (const f of fileNames) {
       const src = join(sourceDir, f);
@@ -82,28 +84,38 @@ export async function POST(request: NextRequest) {
   const workDir = join('/tmp', `pptx-preview-${randomUUID()}`);
 
   try {
-    const { job_id, filename } = await request.json();
+    const { job_id, filename, which } = await request.json();
     if (!job_id) {
       return NextResponse.json({ error: 'job_id is required' }, { status: 400 });
     }
+    // 'translated' (default) renders the exported deck, 'original' the deck as uploaded;
+    // the two are cached separately so switching back and forth is instant.
+    const deckKind: 'original' | 'translated' = which === 'original' ? 'original' : 'translated';
+    const cacheKey = deckKind === 'original' ? `${job_id}--original` : job_id;
 
     // --- Check cache first ---
-    const cached = loadCachedImages(job_id);
+    const cached = loadCachedImages(cacheKey);
     if (cached) {
-      return NextResponse.json({ images: cached, total: cached.length, cached: true });
+      return NextResponse.json({ images: cached, total: cached.length, cached: true, which: deckKind });
     }
 
     // --- Generate fresh ---
-    // 1. Download the translated PPTX from Python backend
-    const exportRes = await fetch(`${PYTHON_BACKEND_URL}/api/export`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_id, filename: filename || `translated_${job_id}.pptx` }),
-    });
-    if (!exportRes.ok) {
-      return NextResponse.json({ error: 'Failed to fetch translated PPTX' }, { status: 500 });
+    // 1. Download the deck from the Python backend. The translated side is built on
+    //    demand by POST /api/export; the original side is the upload returned as-is,
+    //    which is the whole reason both can be shown side by side.
+    const deckRes = deckKind === 'original'
+      ? await fetch(`${PYTHON_BACKEND_URL}/api/source?job_id=${encodeURIComponent(job_id)}`)
+      : await fetch(`${PYTHON_BACKEND_URL}/api/export`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id, filename: filename || `translated_${job_id}.pptx` }),
+        });
+    if (!deckRes.ok) {
+      return NextResponse.json(
+        { error: `Failed to fetch the ${deckKind} PPTX` }, { status: 500 },
+      );
     }
-    const pptxBuffer = Buffer.from(await exportRes.arrayBuffer());
+    const pptxBuffer = Buffer.from(await deckRes.arrayBuffer());
 
     // 2. Save to work dir
     mkdirSync(workDir, { recursive: true });
@@ -139,13 +151,13 @@ export async function POST(request: NextRequest) {
     });
 
     // 6. Cache the generated PNGs for next time
-    saveToCache(job_id, workDir, files);
+    saveToCache(cacheKey, workDir, files);
 
     // 7. Cleanup work dir + sweep old cache entries
     rmSync(workDir, { recursive: true, force: true });
     sweepCache();
 
-    return NextResponse.json({ images, total: images.length, cached: false });
+    return NextResponse.json({ images, total: images.length, cached: false, which: deckKind });
 
   } catch (error) {
     try { rmSync(workDir, { recursive: true, force: true }); } catch { /* ok */ }

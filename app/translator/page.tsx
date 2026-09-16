@@ -10,6 +10,23 @@ interface TextBox { box_id: string; shape_type: string; runs: TextRun[]; constra
 interface Slide { slide_index: number; slide_id: number; text_boxes: TextBox[]; }
 interface UploadedDocument { job_id: string; filename: string; total_slides: number; total_text_boxes: number; total_runs: number; slides: Slide[]; }
 interface TranslatedRun { run_id: string; original_text: string; translated_text: string; source_language: string; target_language: string; model_used: string; adjusted_font_size: number | null; }
+// Served by /api/models (backend model_catalog). The page never carries its own
+// copy of the list: the hardcoded one had drifted from the registry behind it.
+interface CatalogModel { key: string; label: string; lane: 'gemini' | 'opencode'; model: string; note?: string; }
+interface ModelCatalog { translate: CatalogModel[]; vision: CatalogModel[]; defaults: { translate: string; vision: string }; }
+interface QaIssue { slide: number; type: string; severity: string; where?: string | null; detail?: string | null; }
+interface QaReport {
+  model?: string; slides_rendered?: number; slides_checked?: number; summary?: string;
+  issues: QaIssue[]; errors?: { slide: number; error: string }[];
+  /** The deck's length, so the panel knows how many chunks a full check needs. */
+  deck_slides?: number | null;
+  first_slide?: number | null; last_slide?: number | null;
+}
+
+// A slide check takes minutes (one vision call per slide, ~85 s each) so the backend
+// runs it detached and this panel polls. Five seconds is enough to feel live without
+// hammering the backend while a slow model thinks.
+const QA_POLL_MS = 5000;
 interface HealthStatus { settings: Record<string, boolean | string>; }
 interface BatchItem {
   file: File;
@@ -51,6 +68,18 @@ const en = {
   previewSlides: 'Preview slides',
   generatingPreview: 'Generating preview images...',
   previewError: 'Could not generate preview images',
+  previewOriginal: 'Before (original)', previewTranslated: 'After (translated)',
+  slideCheck: 'Slide check (vision)',
+  slideCheckHint: 'Reads the translated slides as images and reports layout damage — text spilling out of a box, overlap, clipping. Report-only: it never changes the deck.',
+  slideCheckModel: 'Vision model',
+  runSlideCheck: 'Check slides',
+  checking: 'Checking…',
+  slideCheckClean: 'No layout damage reported.',
+  slideCheckErrored: 'Slides the check could not read:',
+  slideCheckError: 'The slide check failed.',
+  slideCheckOptIn: 'Opt-in — runs only when you press the button.',
+  slideCheckProgress: 'Checking slides',
+  slideCheckPartialLead: 'slides reviewed before it stopped:',
   slideImage: 'Slide image',
   previous: 'Previous', next: 'Next',
   renderingPreview: 'Rendering slides...',
@@ -91,6 +120,18 @@ const ja: typeof en = {
   previewSlides: 'スライドプレビュー',
   generatingPreview: 'プレビュー画像を生成中...',
   previewError: 'プレビュー画像を生成できませんでした',
+  previewOriginal: 'ビフォー（原文）', previewTranslated: 'アフター（翻訳後）',
+  slideCheck: 'スライド検査（画像）',
+  slideCheckHint: '翻訳後のスライドを画像として読み、レイアウトの崩れ（テキストのはみ出し・重なり・欠け）を報告します。報告のみで、資料は変更しません。',
+  slideCheckModel: '画像モデル',
+  runSlideCheck: '検査する',
+  checking: '検査中…',
+  slideCheckClean: 'レイアウトの崩れは報告されませんでした。',
+  slideCheckErrored: '読み取れなかったスライド:',
+  slideCheckError: 'スライド検査に失敗しました。',
+  slideCheckOptIn: '任意実行 — ボタンを押したときだけ実行されます。',
+  slideCheckProgress: '検査中',
+  slideCheckPartialLead: '中断までに検査できたスライド:',
   slideImage: 'スライド画像',
   previous: '前へ', next: '次へ',
   renderingPreview: 'スライドをレンダリング中...',
@@ -138,6 +179,16 @@ export default function NewTranslatorPage() {
   const [sourceLang, setSourceLang] = useState<'ja' | 'en'>('en');
   const [targetLang, setTargetLang] = useState<'ja' | 'en'>('ja');
   const [model, setModel] = useState<string>('gemini-25-flash-lite');
+  // The catalog decides what the pickers offer, so a list edit in the backend shows
+  // up here without touching this file.
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
+  const [visionModel, setVisionModel] = useState<string>('');
+  const [qaReport, setQaReport] = useState<QaReport | null>(null);
+  const [qaRunning, setQaRunning] = useState(false);
+  const [qaError, setQaError] = useState<string | null>(null);
+  const [qaProgress, setQaProgress] = useState<{ checked: number; total: number | null } | null>(null);
+  // Bumped per run so a superseded loop stops instead of writing a stale report.
+  const qaRunRef = useRef(0);
   const [contextPrompt, setContextPrompt] = useState('');
   const [glossaryTerms, setGlossaryTerms] = useState(''); // New state for glossary
   const [sampleLoading, setSampleLoading] = useState(false);
@@ -147,6 +198,7 @@ export default function NewTranslatorPage() {
   const [previewImages, setPreviewImages] = useState<string[]>([]);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewWhich, setPreviewWhich] = useState<'translated' | 'original'>('translated');
   const [currentSlide, setCurrentSlide] = useState(0);
 
   // Live progress polling (translate phase)
@@ -269,7 +321,11 @@ export default function NewTranslatorPage() {
     : [];
 
   // Generate preview images after translation
-  const generatePreview = useCallback(async (jobId: string, filename: string) => {
+  // which: 'translated' is the exported deck, 'original' the file as uploaded — the
+  // two sides together are the before/after view. Switching back to a side already
+  // rendered is instant because the preview route caches each side separately.
+  const generatePreview = useCallback(async (jobId: string, filename: string, which: 'translated' | 'original' = 'translated') => {
+    setPreviewWhich(which);
     setPreviewLoading(true);
     setPreviewError(null);
     setCurrentSlide(0);
@@ -277,7 +333,7 @@ export default function NewTranslatorPage() {
       const res = await fetch('/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: jobId, filename }),
+        body: JSON.stringify({ job_id: jobId, filename, which }),
       });
       if (!res.ok) throw new Error(text.previewError);
       const data = await res.json();
@@ -288,6 +344,73 @@ export default function NewTranslatorPage() {
       setPreviewLoading(false);
     }
   }, [ui]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Which models may be offered comes from the backend, so the picker and the
+  // translation registry cannot disagree about a label.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/models')
+      .then(res => (res.ok ? res.json() : Promise.reject(new Error('catalog'))))
+      .then((data: ModelCatalog) => {
+        if (cancelled) return;
+        setCatalog(data);
+        setVisionModel(prev => prev || data.defaults.vision);
+        setModel(prev => (data.translate.some(m => m.key === prev) ? prev : data.defaults.translate));
+      })
+      .catch(() => { /* the picker falls back to whatever the registry default is */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  // The slide check is opt-in and report-only: it renders the slides and asks a
+  // vision model what looks broken. It never edits the deck and never blocks export.
+  // The backend runs the check detached (minutes, one vision call per slide) and this
+  // only starts it and polls, so a slow-but-accurate model never costs us the run.
+  const runSlideCheck = useCallback(async (jobId: string) => {
+    const run = qaRunRef.current + 1;
+    qaRunRef.current = run;
+    setQaRunning(true); setQaError(null); setQaReport(null); setQaProgress(null);
+    let checked = 0, rendered = 0;
+    try {
+      const started = await fetch('/api/qa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, which: 'translated', model: visionModel }),
+      });
+      const start = await started.json().catch(() => null);
+      if (!started.ok) throw new Error(start?.error || start?.detail || text.slideCheckError);
+
+      for (;;) {
+        await new Promise(resolve => setTimeout(resolve, QA_POLL_MS));
+        if (qaRunRef.current !== run) return;
+        const status = await fetch(
+          `/api/qa?job_id=${encodeURIComponent(jobId)}&which=translated`,
+          { cache: 'no-store' },
+        );
+        const state = await status.json().catch(() => null);
+        if (!status.ok) throw new Error(state?.error || state?.detail || text.slideCheckError);
+        if (qaRunRef.current !== run) return;
+
+        // Publish whatever the backend already reviewed: findings show up slide by
+        // slide, and a poll that fails never discards the slides done so far.
+        if (state?.report) setQaReport(state.report);
+        checked = state?.report?.slides_checked ?? state?.checked ?? checked;
+        rendered = state?.report?.slides_rendered ?? rendered;
+        setQaProgress({ checked, total: state?.total ?? null });
+
+        if (state?.state === 'done') break;
+        if (state?.state === 'failed') throw new Error(state?.error || text.slideCheckError);
+      }
+    } catch (e) {
+      const reason = e instanceof Error && e.message ? e.message : text.slideCheckError;
+      // Say how far the check got: an interrupted run leaves slides unread, and
+      // "failed" alone would read as "nothing was reviewed".
+      if (qaRunRef.current === run) {
+        setQaError(checked ? `${reason} — ${text.slideCheckPartialLead} ${checked}/${rendered}` : reason);
+      }
+    } finally {
+      if (qaRunRef.current === run) { setQaRunning(false); setQaProgress(null); }
+    }
+  }, [visionModel, ui]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleFile = useCallback(async (file: File) => {
     if (!file.name.endsWith('.pptx')) { setError(text.onlyPptx); return; }
@@ -678,20 +801,23 @@ export default function NewTranslatorPage() {
                   <h3 className="text-xs font-medium text-gray-500 dark:text-zinc-400 uppercase tracking-wider mb-4">{text.model}</h3>
                   <select value={model} onChange={e => setModel(e.target.value)}
                     className="w-full border border-gray-300 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm bg-white dark:bg-zinc-800 text-gray-700 dark:text-zinc-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 appearance-none cursor-pointer mb-3">
-                    <optgroup label={ui === 'en' ? 'Recommended' : 'おすすめ'}>
-                      <option value="gemini-25-flash-lite">{ui === 'en' ? '⚡ Fast — great for most decks (free tier friendly)' : '⚡ 高速 — ほとんどの資料に最適（無料枠向け）'}</option>
-                    </optgroup>
-                    <optgroup label="Google Gemini">
-                      <option value="gemini-flash-lite">Gemini 3.1 Flash Lite</option>
-                      <option value="gemini-flash">Gemini 3.5 Flash</option>
-                      <option value="gemini-pro">Gemini 3 Pro</option>
-                    </optgroup>
-                    <optgroup label="OpenCode">
-                      <option value="opencode-deepseek">DeepSeek V4</option>
-                      <option value="opencode-kimi">Kimi K2.5</option>
-                      <option value="opencode-qwen">Qwen Max</option>
-                      <option value="opencode-minimax">MiniMax M2.5</option>
-                    </optgroup>
+                    {catalog ? (
+                      <>
+                        {(['gemini', 'opencode'] as const).map(lane => (
+                          <optgroup key={lane} label={lane === 'gemini' ? 'Google Gemini' : 'OpenCode'}>
+                            {catalog.translate.filter(m => m.lane === lane).map(m => (
+                              <option key={m.key} value={m.key}>
+                                {m.key === catalog.defaults.translate ? '★ ' : ''}{m.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </>
+                    ) : (
+                      // Until the catalog loads, offer the one key the backend is known
+                      // to resolve rather than an empty picker.
+                      <option value={model}>{model}</option>
+                    )}
                   </select>
                   <input type="text" value={contextPrompt} onChange={e => setContextPrompt(e.target.value)}
                     placeholder={text.contextPlaceholder}
@@ -751,7 +877,23 @@ export default function NewTranslatorPage() {
               {/* === Preview Images === */}
               {allDone && (
                 <div className="mt-8 border-t border-gray-200 dark:border-zinc-800 pt-8">
-                  <h2 className="text-base font-medium text-gray-700 dark:text-zinc-200 mb-4">{text.previewSlides}</h2>
+                  <div className="flex items-center justify-between gap-3 mb-4">
+                    <h2 className="text-base font-medium text-gray-700 dark:text-zinc-200">{text.previewSlides}</h2>
+                    {document && (
+                      <div className="flex rounded-lg border border-gray-200 dark:border-zinc-800 overflow-hidden text-xs">
+                        {([['original', text.previewOriginal], ['translated', text.previewTranslated]] as const).map(([kind, label]) => (
+                          <button
+                            key={kind}
+                            onClick={() => generatePreview(document.job_id, document.filename, kind)}
+                            disabled={previewLoading}
+                            className={`px-3 py-1.5 transition-colors disabled:opacity-50 ${previewWhich === kind ? 'bg-blue-600 text-white' : 'text-gray-600 dark:text-zinc-300 hover:bg-gray-100 dark:hover:bg-zinc-800'}`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
                   {/* Loading preview */}
                   {previewLoading && (
@@ -837,6 +979,89 @@ export default function NewTranslatorPage() {
                         )}
 
                       </div>
+                    </div>
+                  )}
+
+                  {/* Slide check — opt-in, report-only. Its own model list: the
+                      translation models cannot read images at all. */}
+                  {document && (
+                    <div className="border-t border-gray-200 dark:border-zinc-800 pt-5">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-medium text-gray-700 dark:text-zinc-200">{text.slideCheck}</h3>
+                          <p className="text-xs text-gray-400 dark:text-zinc-500 mt-0.5">{text.slideCheckOptIn}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <select value={visionModel} onChange={e => setVisionModel(e.target.value)}
+                            aria-label={text.slideCheckModel}
+                            className="border border-gray-300 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm bg-white dark:bg-zinc-800 text-gray-700 dark:text-zinc-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 appearance-none cursor-pointer">
+                            {(catalog?.vision || []).map(m => (
+                              <option key={m.model} value={m.model}>
+                                {m.model === catalog?.defaults.vision ? '★ ' : ''}{m.label}
+                              </option>
+                            ))}
+                          </select>
+                          <button onClick={() => runSlideCheck(document.job_id)} disabled={qaRunning || !visionModel}
+                            className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 dark:disabled:bg-zinc-700 disabled:text-gray-500 dark:disabled:text-zinc-500 transition-colors">
+                            {qaRunning ? text.checking : text.runSlideCheck}
+                          </button>
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-zinc-400 mt-2 leading-relaxed">{text.slideCheckHint}</p>
+
+                      {qaRunning && qaProgress && (
+                        <p className="mt-2 text-xs text-indigo-600 dark:text-indigo-400">
+                          {text.slideCheckProgress} {qaProgress.checked}
+                          {qaProgress.total ? ` / ${qaProgress.total}` : ''}…
+                        </p>
+                      )}
+
+                      {qaError && (
+                        <div className="mt-3 px-4 py-2.5 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-lg text-sm text-red-700 dark:text-red-300">{qaError}</div>
+                      )}
+
+                      {qaReport && (
+                        <div className="mt-3">
+                          <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="text-gray-600 dark:text-zinc-300 bg-gray-100 dark:bg-zinc-800 px-2.5 py-1 rounded-full">{qaReport.summary}</span>
+                            {qaReport.model && <span className="text-gray-400 dark:text-zinc-500">{qaReport.model}</span>}
+                          </div>
+
+                          {/* Not while a later chunk may still turn something up: a
+                              green "nothing found" after chunk 1 of 20 is a lie. */}
+                          {!qaRunning && qaReport.issues.length === 0 && !(qaReport.errors || []).length && (
+                            <p className="mt-2 text-sm text-green-700 dark:text-green-300">{text.slideCheckClean}</p>
+                          )}
+
+                          {qaReport.issues.map((issue, i) => (
+                            <div key={i} className={`mt-2 px-4 py-3 rounded-lg border text-sm ${
+                              issue.severity === 'high'
+                                ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-900'
+                                : issue.severity === 'medium'
+                                  ? 'bg-yellow-50 dark:bg-yellow-950/40 border-yellow-200 dark:border-yellow-900'
+                                  : 'bg-gray-50 dark:bg-zinc-900 border-gray-200 dark:border-zinc-800'
+                            }`}>
+                              <div className="flex items-center gap-2 text-xs mb-1">
+                                <span className="font-medium text-gray-700 dark:text-zinc-200">{text.slideLabel} {issue.slide}</span>
+                                <span className="uppercase tracking-wider text-gray-500 dark:text-zinc-400">{issue.severity} · {issue.type}</span>
+                              </div>
+                              {issue.where && <div className="text-gray-700 dark:text-zinc-200 text-xs font-medium">{issue.where}</div>}
+                              {issue.detail && <div className="text-gray-600 dark:text-zinc-300 text-xs mt-0.5 leading-relaxed">{issue.detail}</div>}
+                            </div>
+                          ))}
+
+                          {(qaReport.errors || []).length > 0 && (
+                            <div className="mt-2 px-4 py-3 rounded-lg border border-orange-200 dark:border-orange-900 bg-orange-50 dark:bg-orange-950/40">
+                              <div className="text-xs font-medium text-orange-700 dark:text-orange-300 mb-1">{text.slideCheckErrored}</div>
+                              <ul className="text-xs text-orange-700 dark:text-orange-300 space-y-0.5">
+                                {(qaReport.errors || []).map((err, i) => (
+                                  <li key={i}>{text.slideLabel} {err.slide}: {err.error}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

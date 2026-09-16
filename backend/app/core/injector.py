@@ -14,6 +14,11 @@ import os
 from lxml import etree
 
 from app.models import TranslatedRun, TranslationJob, SpatialConstraints
+from app.core.smartart import (
+    find_diagram_part,
+    is_smartart_graphic_frame,
+    iter_text_nodes,
+)
 
 
 SMARTART_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData'
@@ -29,10 +34,15 @@ A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 
 # Typeface written for Japanese output. python-pptx's font.name only sets
 # <a:latin>, which does not drive CJK glyph selection, so the previous override
-# was cosmetic for Japanese text. Override with JP_FONT_FAMILY — set it to a font
-# the preview renderer actually has ('Noto Sans JP') to make previews truthful,
-# since Yu Gothic is not installed on Linux.
+# was cosmetic for Japanese text. Override with JP_FONT_FAMILY when the machine
+# that renders previews lacks the family; core/fonts.py checks that and
+# /api/health reports it, because fontconfig substitutes silently.
 JP_FONT_FAMILY = os.environ.get('JP_FONT_FAMILY', 'Yu Gothic')
+
+# Per-shape and per-paragraph trace lines run to hundreds of lines on a real deck
+# (one line per shape per slide), which buries the one line per job that a log is
+# for. Off unless PPTX_VERBOSE=1; the end-of-run summary and the error lines stay on.
+VERBOSE = os.environ.get('PPTX_VERBOSE', '') not in ('', '0', 'false', 'False')
 
 
 # Average character widths for font size estimation
@@ -254,6 +264,29 @@ def find_shape_by_index(shape, shape_idx: str) -> Optional[Shape]:
     return None
 
 
+def resolve_shape_path(slide, index_parts):
+    """Resolve a shape index path ("3", or "3.1" for a group child) to a shape.
+
+    Returns None when a step does not resolve; the caller then decides whether to
+    guess or to report the run as failed.
+    """
+    container = slide
+    shape = None
+    for part in index_parts:
+        if not str(part).isdigit():
+            return None
+        shapes = getattr(container, 'shapes', None)
+        if shapes is None:
+            return None
+        shapes = list(shapes)
+        idx = int(part)
+        if idx < 0 or idx >= len(shapes):
+            return None
+        shape = shapes[idx]
+        container = shape
+    return shape
+
+
 def inject_smartart_text(
     shape: GraphicFrame,
     translated_runs: list[TranslatedRun],
@@ -262,59 +295,44 @@ def inject_smartart_text(
     """Inject translated text into a SmartArt diagram via its XML."""
     failed_runs = []
     try:
-        shape_el = shape._element
-        graphic_data = shape_el.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData')
-        if graphic_data is None:
-            return translated_runs
+        # Shared resolution: one place decides what a SmartArt text node is, so
+        # extraction and injection cannot disagree (see core/smartart.py).
+        dgm_part, dgm_xml = find_diagram_part(shape, None)
+        if dgm_part is None or dgm_xml is None:
+            # Only SmartArt run ids are routed here, so an unresolvable diagram
+            # is a real failure. Returning the runs unchanged would hide it.
+            return list(translated_runs)
         
-        uri = graphic_data.get('uri', '')
-        if SMARTART_DGM_URI not in uri:
-            return translated_runs
-        
-        # Find relId — SmartArt uses <dgm:relIds> with r:dm
-        rel_ids_el = graphic_data.find('.//dgm:relIds', PPTX_NS)
-        rel_id = None
-        if rel_ids_el is not None:
-            rel_id = rel_ids_el.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}dm')
-        else:
-            for child in graphic_data:
-                rel_id = child.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
-                if rel_id:
-                    break
-        
-        if not rel_id:
-            return translated_runs
-        
-        # Get slide part
-        try:
-            # Access the diagram data part via relationship
-            dgm_part = shape.part.related_part(rel_id) if hasattr(shape, 'part') else None
-        except (KeyError, AttributeError):
-            dgm_part = None
-        
-        if dgm_part is None:
-            return translated_runs
-        
-        dgm_xml = etree.fromstring(dgm_part.blob)
-        
-        # Snapshot the text nodes once, in document order, skipping empties — the
-        # same order the extractor used. The extractor skips empty <a:t> while this
-        # code did not, so every node past the first empty one received another
-        # node's translation, silently. Snapshotting also stops the indices from
-        # shifting when a translated string is empty.
-        a_t_elements = [t for t in dgm_xml.iter(f'{{{A_NS}}}t') if (t.text or '').strip()]
+        # Snapshot the nodes once, through the shared enumerator (document order,
+        # empties skipped) — the same list extraction numbered its runs from.
+        # Snapshotting also stops the indices from shifting mid-loop.
+        a_t_elements = iter_text_nodes(dgm_xml)
         placed = 0
         
         for tr in translated_runs:
             try:
+                # The ordinal sits in the second-to-last slot. Parsing by
+                # position from the front breaks when the shape index is a group
+                # path ("3_1") and adds underscores to the id.
                 run_parts = tr.run_id.split('_')
-                run_idx = int(run_parts[4]) if len(run_parts) > 4 else 0
+                run_idx = int(run_parts[-2]) if len(run_parts) >= 2 else 0
                 
-                if run_idx < len(a_t_elements):
-                    a_t_elements[run_idx].text = tr.translated_text
-                    placed += 1
-                else:
+                if run_idx < 0 or run_idx >= len(a_t_elements):
                     failed_runs.append(tr)
+                    continue
+                
+                node = a_t_elements[run_idx]
+                # Integrity gate: the ordinal is only trustworthy while the node
+                # still holds the text extraction saw. If it does not, the two
+                # sides have diverged — refuse the write and report it, because
+                # the alternative is overwriting another node's text silently.
+                expected = (tr.original_text or '').strip()
+                if expected and (node.text or '').strip() != expected:
+                    failed_runs.append(tr)
+                    continue
+                
+                node.text = tr.translated_text
+                placed += 1
             except Exception:
                 failed_runs.append(tr)
         
@@ -469,7 +487,8 @@ def replace_text_in_shape(
     
     # Replace text in each paragraph
     paragraphs = list(text_frame.paragraphs)
-    print(f"  [INJECTOR] shape {shape_idx}: {len(paragraphs)} paragraphs, {len(runs_by_paragraph)} run groups")
+    if VERBOSE:
+        print(f"  [INJECTOR] shape {shape_idx}: {len(paragraphs)} paragraphs, {len(runs_by_paragraph)} run groups")
     
     for para_idx_str, runs in runs_by_paragraph.items():
         try:
@@ -483,7 +502,7 @@ def replace_text_in_shape(
             # One scale for the whole paragraph — per-run scaling made runs of the
             # same paragraph different sizes.
             para_scale = paragraph_font_scale(runs)
-            if para_scale < 1.0:
+            if para_scale < 1.0 and VERBOSE:
                 print(f"  [INJECTOR] paragraph-level scale {para_scale:.3f} on para {para_idx_str} of shape {shape_idx}")
             
             for tr in runs:
@@ -572,11 +591,19 @@ def inject_translations(
                     # Find the shape
                     shape = None
                     if is_smartart:
-                        # SmartArt: find the GraphicFrame in the slide
-                        for s_idx, s in enumerate(slide.shapes):
-                            if isinstance(s, GraphicFrame):
-                                shape = s
-                                break
+                        # Resolve by the extractor's own shape index instead of
+                        # taking the first GraphicFrame: when a slide held a table
+                        # and a diagram (or two diagrams) every SmartArt run went
+                        # to the wrong shape and the write landed in the wrong
+                        # node. Nested diagrams carry a path ("smartart.3.1").
+                        shape = resolve_shape_path(slide, shape_idx_parts[1:])
+                        if shape is not None and not is_smartart_graphic_frame(shape):
+                            shape = None
+                        if shape is None:
+                            # Guess only when the slide holds exactly one diagram;
+                            # with two, guessing is how text moves between them.
+                            frames = [s for s in slide.shapes if is_smartart_graphic_frame(s)]
+                            shape = frames[0] if len(frames) == 1 else None
                     elif len(shape_idx_parts) == 1:
                         # Simple index
                         idx = int(shape_idx_parts[0])
@@ -596,6 +623,10 @@ def inject_translations(
                     if shape:
                         failed = replace_text_in_shape(shape, shape_runs, slide_idx, shape_idx_str)
                         failed_runs.extend(failed)
+                    elif is_smartart:
+                        # Never leave a SmartArt run unaccounted for: it surfaces
+                        # as an injection failure instead of a silent no-op.
+                        failed_runs.extend(shape_runs)
                     else:
                         # Try to find by iterating all shapes
                         for s_idx, s in enumerate(slide.shapes):

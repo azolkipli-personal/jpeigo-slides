@@ -6,13 +6,58 @@ from abc import ABC, abstractmethod
 from typing import Optional
 import httpx
 import asyncio
+import uuid
 
 from app.config import Settings
+from app.core.textnorm import strip_reasoning
+
+
+# A provider that does not know the configured model fails every request and the
+# failover chain then supplies another provider, so the job ends with original
+# text and success=False — indistinguishable from a bad translation. Record the
+# reason so the app can name the wrong model. Markers cover providers' wordings.
+MISSING_MODEL_MARKERS = (
+    # Gemini: 'models/<id> is not found for API version v1beta, or is not
+    # supported for generateContent' — a wrong ID is a 404, and the message is
+    # truncated before it says anything else, so match the opening phrase.
+    'is not found',
+    'is no longer available',
+    'no longer supported',
+    'model is unavailable',
+    'not supported for generatecontent',
+    'model not found',
+    'model_not_found',
+    'does not exist',
+    "doesn't exist",
+    'unknown model',
+    'unsupported model',
+    'invalid model',
+    'no such model',
+    'not a valid model',
+    'model is not available',
+)
+
+
+def is_missing_model_error(message: str) -> bool:
+    """True when an error text blames the model ID rather than the request."""
+    lowered = (message or '').lower()
+    return any(marker in lowered for marker in MISSING_MODEL_MARKERS)
 
 
 class TranslatorInterface(ABC):
-    """Abstract interface for translation services."""
-    
+    """Abstract interface for translation services.
+
+    `last_error` carries the reason for the most recent failure: failover hides
+    failures by design, so the reason must be retrievable after the fact.
+    """
+
+    last_error: str = ''
+
+    def _fail(self, text: str, message: str) -> tuple[str, bool]:
+        """Record why a translation did not happen, then report failure."""
+        self.last_error = message
+        return text, False
+
     @abstractmethod
     async def translate(
         self,
@@ -51,14 +96,14 @@ class GeminiTranslator(TranslatorInterface):
         context: Optional[str] = None,
     ) -> tuple[str, bool]:
         if not self.api_key:
-            return text, False
+            return self._fail(text, 'no API key configured')
         
         lang_map = {
             'ja': 'Japanese',
             'en': 'English',
         }
         
-        parts = []
+        parts: list[str] = []
         if context:
             parts.append(context.strip())
         parts.append(
@@ -94,14 +139,31 @@ class GeminiTranslator(TranslatorInterface):
                     data = response.json()
                     candidates = data.get("candidates", [{}])
                     if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if parts:
-                            translated = parts[0].get("text", text)
-                            return translated.strip(), True
-                return text, False
+                        # Response parts, not the prompt `parts` above: reusing the
+                        # name made the next request look like it consumed the reply.
+                        response_parts = candidates[0].get("content", {}).get("parts", [])
+                        if response_parts:
+                            translated = response_parts[0].get("text", text)
+                            # A reasoning wrapper is never part of a translation.
+                            # An answer that is only reasoning means the model never
+                            # translated, so fail rather than paste thinking onto a
+                            # slide — that also lets the failover chain run.
+                            cleaned = strip_reasoning(translated)
+                            if not cleaned:
+                                message = "answered with reasoning only, no translation"
+                                print(f"Gemini {message} (model={self.model})")
+                                return self._fail(text, message)
+                            return cleaned.strip(), True
+                    message = f"HTTP 200 without candidate text: {response.text[:200]}"
+                    print(f"Gemini {message} (model={self.model})")
+                    return self._fail(text, message)
+                message = f"HTTP {response.status_code}: {response.text[:200]}"
+                print(f"Gemini {message} (model={self.model})")
+                return self._fail(text, message)
         except Exception as e:
-            print(f"Gemini translation error ({self.model}): {e}")
-            return text, False
+            message = f"[{type(e).__name__}] {e}"
+            print(f"Gemini translation error (model={self.model}): {message}")
+            return self._fail(text, message)
     
     def get_model_name(self) -> str:
         return self.model
@@ -114,6 +176,12 @@ class OpenCodeTranslator(TranslatorInterface):
         self.api_url = settings.opencode_api_url
         self.api_key = settings.opencode_api_key
         self.model = model
+        # OpenCode Go enforces x-opencode-session: requests without it come back
+        # 400 "missing x-opencode-session" and the whole OpenCode lane fails, so
+        # failover silently has nowhere to go. The value is an opaque routing
+        # hint, and stability keeps the provider's prompt cache warm, so it is
+        # generated once per translator instead of once per request.
+        self.session_id = f"jpeigo-{uuid.uuid4().hex[:16]}"
     
     async def translate(
         self,
@@ -123,7 +191,7 @@ class OpenCodeTranslator(TranslatorInterface):
         context: Optional[str] = None,
     ) -> tuple[str, bool]:
         if not self.api_key:
-            return text, False
+            return self._fail(text, 'no API key configured')
         
         lang_map = {
             'ja': 'Japanese',
@@ -148,6 +216,9 @@ Translation:"""
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
+                        # Required by OpenCode Go since 09/05; without it every
+                        # request is a 400 and the failover lane is dead.
+                        "x-opencode-session": self.session_id,
                     },
                     json={
                         "model": model_id,
@@ -159,14 +230,25 @@ Translation:"""
                 if response.status_code == 200:
                     data = response.json()
                     translated = data.get("choices", [{}])[0].get("message", {}).get("content", text)
-                    return translated.strip(), True
-                print(f"OpenCode HTTP {response.status_code} ({self.model}): {response.text[:200]}")
-                return text, False
+                    # minimax-m3 replies with "<think>The user wants me to
+                    # translate…" ahead of the answer, and that wrapper would land
+                    # in a slide verbatim. Strip it; a reasoning-only answer means
+                    # no translation happened, so fail and let failover run.
+                    cleaned = strip_reasoning(translated)
+                    if not cleaned:
+                        message = "answered with reasoning only, no translation"
+                        print(f"OpenCode {message} (model={model_id})")
+                        return self._fail(text, message)
+                    return cleaned.strip(), True
+                message = f"HTTP {response.status_code}: {response.text[:200]}"
+                print(f"OpenCode {message} (model={model_id})")
+                return self._fail(text, message)
         except Exception as e:
             # Include the exception type: many network errors stringify to an
             # empty message (TimeoutError), which is useless for diagnosis.
-            print(f"OpenCode translation error [{type(e).__name__}]: {e}")
-            return text, False
+            message = f"[{type(e).__name__}] {e}"
+            print(f"OpenCode translation error (model={model_id}): {message}")
+            return self._fail(text, message)
     
     def get_model_name(self) -> str:
         return f"opencode-{self.model}"
@@ -503,17 +585,34 @@ class TranslationService:
     
     def __init__(self, settings: Settings):
         self.settings = settings
+        # Last failure per model name, so a bad model ID or a dead provider stays
+        # reportable after the failover chain has papered over it. validate_models()
+        # probes at startup and /api/health exposes the readout.
+        self.model_errors: dict[str, str] = {}
         self.translators = {
             # Gemini models (queried from live API)
-            'gemini-pro': GeminiTranslator(settings, 'gemini-3-pro-preview'),
+            # gemini-3-pro-preview was retired by the provider (404 "no longer
+            # available, use gemini-3.1-pro-preview"); the probe in
+            # validate_models() caught it — a dead ID here fails every job.
+            'gemini-pro': GeminiTranslator(settings, 'gemini-3.1-pro-preview'),
             'gemini-flash': GeminiTranslator(settings, 'gemini-3.5-flash'),
             'gemini-flash-lite': GeminiTranslator(settings, 'gemini-3.1-flash-lite'),
             'gemini-25-flash-lite': GeminiTranslator(settings, 'gemini-2.5-flash-lite'),
+            'gemini-flash-38': GeminiTranslator(settings, 'gemini-3.8-flash'),
             # OpenCode models (proxy to the best available)
-            'opencode-deepseek': OpenCodeTranslator(settings, 'deepseek-v4-flash'),
-            'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k2.5'),
-            'opencode-qwen': OpenCodeTranslator(settings, 'qwen3.7-plus'),
-            'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m2.5'),
+            # deepseek-v4-flash is gone: v4.1-flash answers better in the same lane
+            # and also reads slide images, so one flat-rate model covers translation
+            # and the slide check instead of two near-identical entries.
+            'opencode-deepseek': OpenCodeTranslator(settings, 'deepseek-v4.1-flash'),
+            # kimi-k2.5 is retired upstream ("Model is unavailable"); kimi-k2.6 and
+            # kimi-k3 both answer, so use the current one.
+            'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k3'),
+            'opencode-qwen': OpenCodeTranslator(settings, 'qwen3.8-max'),
+            # minimax-m2.5 could not read an image at all (HTTP 400); m3 supersedes
+            # it and its reasoning wrapper is stripped before the text is used.
+            'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m3'),
+            'opencode-longcat': OpenCodeTranslator(settings, 'longcat-2.0'),
+            'opencode-glm': OpenCodeTranslator(settings, 'glm-5.3'),
             # Fallback / direct APIs (kept for compatibility)
             'glm': GLMTranslator(settings),
             'kimi': KimiTranslator(settings),
@@ -559,6 +658,35 @@ class TranslationService:
             return ['opencode-deepseek'] if self.settings.opencode_api_key else []
         return ['gemini-25-flash-lite'] if self.settings.gemini_api_key else []
 
+    def _record_failure(self, model_name: str, message: str) -> None:
+        """Remember the last failure per model, flagging a bad model ID loudly.
+
+        Failover keeps a job running when a provider is down, which is right, but
+        it also hides a retired model ID: every run comes back as original text
+        with success=False, which reads as a poor translation rather than a
+        configuration error. Say which model was rejected.
+        """
+        self.model_errors[model_name] = message or 'unknown failure'
+        if is_missing_model_error(message):
+            print(f"  [MODEL-INVALID] {model_name} rejected the model ID: {message}")
+
+    async def validate_models(self) -> dict[str, str]:
+        """Probe every configured model once; return {model: problem} for the failures.
+
+        Opt-in (VALIDATE_MODELS_ON_STARTUP=1) because it spends one small request
+        per configured model. Without it a retired ID only shows up as a job that
+        came back untranslated.
+        """
+        problems: dict[str, str] = {}
+        for key, translator in self.translators.items():
+            if not getattr(translator, 'api_key', None):
+                continue
+            _, ok = await translator.translate('テスト', 'ja', 'en')
+            if not ok:
+                problems[key] = getattr(translator, 'last_error', 'unknown failure')
+                self._record_failure(getattr(translator, 'get_model_name')(), problems[key])
+        return problems
+
     async def translate_text(
         self,
         text: str,
@@ -582,6 +710,8 @@ class TranslationService:
         if success:
             return translated, model_used, True
 
+        self._record_failure(model_used, getattr(translator, 'last_error', ''))
+
         # Auto-failover: try alternate providers (one level deep, no loops)
         for fb_key in self._failover_chain(model):
             fb = self.translators.get(fb_key)
@@ -591,7 +721,12 @@ class TranslationService:
             if fb_success:
                 print(f"  [FAILOVER] {model_used} failed → {fb.get_model_name()} used")
                 return fb_translated, fb.get_model_name(), True
+            self._record_failure(fb.get_model_name(), getattr(fb, 'last_error', ''))
 
+        # Every option failed. The caller keeps the original text with success=False,
+        # and that must not be the only trace: this is a configuration problem more
+        # often than a translation problem.
+        print(f"  [TRANSLATE-FAILED] {model_used} and its fallbacks all failed — original text kept")
         return translated, model_used, False
 
     async def batch_translate(
