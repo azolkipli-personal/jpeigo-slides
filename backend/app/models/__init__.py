@@ -130,6 +130,9 @@ class TranslationJob(BaseModel):
     progress: float = 0.0
     error: Optional[str] = None
     slides: list[Slide] = [] # Added for frontend rehydration
+    # Layer 2 / Layer 3 reports, keyed by pass name. Written only by the opt-in QA
+    # endpoints, kept on the job so a report outlives the request that produced it.
+    qa_reports: dict = {}
 
 
 class TranslationMemoryEntry(BaseModel):

@@ -22,6 +22,7 @@ from app.models import (
     Slide,
     PPTXDocument,
 )
+from app.core.smartart import find_diagram_part, iter_text_nodes, node_path
 
 
 # XML namespaces for PPTX
@@ -347,76 +348,26 @@ def extract_smartart_text(
     """Extract text from a SmartArt diagram shape."""
     runs = []
     try:
-        shape_el = shape._element
-        # Find the graphic data element — it's in the a: namespace, not p:
-        graphic_data = shape_el.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData')
-        if graphic_data is None:
+        # Resolution lives in core/smartart.py: extraction and injection must
+        # agree on which node is which, so neither side owns that decision.
+        dgm_part, dgm_xml = find_diagram_part(shape, slide_part)
+        if dgm_part is None or dgm_xml is None:
             return runs
         
-        # Check if this is a SmartArt (not a chart or table)
-        uri = graphic_data.get('uri', '')
-        if SMARTART_DGM_URI not in uri:
-            return runs
-        
-        # Find the dgm relationship ID — SmartArt uses <dgm:relIds> with r:dm, r:lo, r:qs, r:cs
-        rel_ids_el = graphic_data.find('.//dgm:relIds', PPTX_NAMESPACES)
-        rel_id = None
-        if rel_ids_el is not None:
-            rel_id = rel_ids_el.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}dm')
-        else:
-            # Fallback: try direct relId on child elements
-            for child in graphic_data:
-                rel_id = child.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
-                if rel_id:
-                    break
-        
-        if not rel_id:
-            return runs
-        
-        # Access the diagram data part via relationship
-        try:
-            dgm_part = slide_part.related_part(rel_id)
-            dgm_xml = etree.fromstring(dgm_part.blob)
-        except (KeyError, AttributeError) as e:
-            return runs
-        
-        # Find all text elements in the diagram
-        # SmartArt stores text in <dgm:t> → <a:p> → <a:r> → <a:t> elements
-        # We extract from <a:t> which contains the actual text
-        a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
-        text_idx = 0
-        # Walk <a:t> in document order and skip empties. The previous pt-then-t
-        # walk visited some nodes twice when <dgm:pt> nested, and the injector
-        # matches this expression exactly, so index alignment depends on it.
-        for t_elem in dgm_xml.iter(f'{{{a_ns}}}t'):
-            text = (t_elem.text or '').strip()
-            if not text:
-                continue
-                
-                # Build XML path for re-injection
-                parts = []
-                elem = t_elem
-                while elem is not None:
-                    tag = elem.tag
-                    if '}' in tag:
-                        tag = tag.split('}')[1]
-                    parts.append(tag)
-                    elem = elem.getparent()
-                xml_path = '/'.join(reversed(parts))
-                
-                run_id = generate_run_id(slide_idx, f"smartart_{shape_idx}", 0, text_idx)
-                text_idx += 1
-                
-                runs.append(TextRun(
-                    run_id=run_id,
-                    text=text,
-                    style=FontStyle(),
-                    slide_index=slide_idx,
-                    shape_index=shape_idx,
-                    paragraph_index=0,
-                    run_index=text_idx,
-                    xml_path=xml_path,
-                ))
+        # Node order and the empty-node rule come from the shared enumerator, so
+        # extraction and injection cannot disagree. Ordinals are 0-based and are
+        # exactly the injector's index into the same list.
+        for ordinal, t_elem in enumerate(iter_text_nodes(dgm_xml)):
+            runs.append(TextRun(
+                run_id=generate_run_id(slide_idx, f"smartart_{shape_idx}", 0, ordinal),
+                text=(t_elem.text or '').strip(),
+                style=FontStyle(),
+                slide_index=slide_idx,
+                shape_index=shape_idx,
+                paragraph_index=0,
+                run_index=ordinal,
+                xml_path=node_path(t_elem),  # diagnostics only, never used to resolve
+            ))
     except Exception as e:
         print(f"[EXTRACTOR] SmartArt extraction error: {e}")
     
