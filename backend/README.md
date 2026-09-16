@@ -110,6 +110,18 @@ Upload a PPTX file and extract text runs.
 
 Translate extracted text runs.
 
+**Queued, not synchronous.** This endpoint registers the job and answers
+immediately with `"status": "processing"`; the translation itself runs as a
+background task. Follow it with `GET /api/jobs/{job_id}`, whose response carries
+`translated_runs` once `status` is `"completed"` — or `error` when it is
+`"failed"`. A repeat POST while a job is already translating is answered from the
+run in flight instead of starting a second pass.
+
+Reason: a 1000+ run deck translates for 10+ minutes, and holding an HTTP request
+open that long is fragile — the Next.js proxy in front of this service killed its
+upstream fetch at undici's 300 s headers timeout, so the browser reported
+"translation failed" while the backend went on to finish and store the work.
+
 **Request:**
 ```json
 {
@@ -120,7 +132,7 @@ Translate extracted text runs.
 }
 ```
 
-**Response:**
+**Job record — `GET /api/jobs/{job_id}` once completed:**
 ```json
 {
   "job_id": "uuid",

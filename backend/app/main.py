@@ -1,7 +1,7 @@
 """
 FastAPI endpoints for PPTX translation.
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Header, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -247,6 +247,28 @@ def sanitize_translated_runs(translated_runs: list[TranslatedRun], glossary: Opt
 jobs: dict[str, TranslationJob] = {}
 # job_id -> monotonic timestamp when translation started (for notify timing)
 _job_started_at: dict[str, float] = {}
+# In-flight translation tasks. Held in a set because a bare create_task() result
+# can be garbage-collected mid-run, and per job so a duplicate POST can be
+# answered from the run that is already going instead of starting a second one.
+_bg_tasks: set[asyncio.Task] = set()
+_active_translations: dict[str, asyncio.Task] = {}
+
+
+def load_job(job_id: str):
+    """Look up a job in memory, falling back to the SQLite store.
+
+    Memory is not authoritative: a restart, an out-of-band clear, or a prune can
+    leave the record on disk only. Translate reads the job opportunistically and
+    the status endpoint already rehydrates this way, but export required the
+    in-memory entry on its own — so a session could translate fine and then
+    answer "Job not found" the moment the user pressed Download.
+    """
+    job = jobs.get(job_id)
+    if job is None:
+        job = job_store.load(job_id)
+        if job is not None:
+            jobs[job_id] = job  # rehydrate memory
+    return job
 
 
 class UploadResponse(BaseModel):
@@ -344,6 +366,7 @@ async def upload_pptx(file: UploadFile = File(...)):
                                 "paragraph_index": r.paragraph_index,
                                 "run_index": r.run_index,
                                 "xml_path": r.xml_path,
+                                "merged_span": r.merged_span,
                             }
                             for r in tb.runs
                         ],
@@ -372,18 +395,38 @@ async def upload_pptx(file: UploadFile = File(...)):
 
 
 @app.post("/api/translate", response_model=TranslateResponse)
-async def translate_pptx(request: TranslationRequest, background_tasks: BackgroundTasks):
-    """
-    Translate text runs in a PPTX file.
-    
-    The translation is processed in the background for large files.
+async def translate_pptx(request: TranslationRequest):
+    """Start translating a job's text runs and return immediately.
+
+    The translation itself runs as a background task; clients follow it through
+    GET /api/jobs/{job_id}. Nothing here waits for the work.
+
+    Why it is not synchronous: a 1000+ run deck with a cold cache translates for
+    10+ minutes, and holding an HTTP request open that long is fragile. The
+    Next.js proxy in front of this service cut the upstream fetch at undici's
+    300 s (5 min) headers timeout, so the browser reported "translation failed"
+    at the 5-minute mark while this backend went on to finish the job correctly.
     """
     # Use provided job_id (from upload) or create a new one
     job_id = request.job_id or str(uuid.uuid4())
-    
+
+    running = _active_translations.get(job_id)
+    if running is not None and not running.done():
+        # Duplicate POST (double click, retry): report the run already in flight
+        # instead of translating the same job twice.
+        current = load_job(job_id)
+        return TranslateResponse(
+            job_id=job_id,
+            status=current.status if current else "processing",
+            progress=current.progress if current else 0.0,
+            total_runs=len(request.runs),
+            translated_runs=[],
+        )
+
     # Initialize or update job
     if job_id in jobs:
         jobs[job_id].status = "processing"
+        jobs[job_id].error = None
         jobs[job_id].total_runs = len(request.runs)
         jobs[job_id].progress = 0.0
     else:
@@ -396,10 +439,31 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
             total_runs=len(request.runs),
             translated_runs=[],
             progress=0.0,
-            slides=[], # No slides available during translate-only creation
+            slides=[],  # No slides available during translate-only creation
         )
     job_store.save(jobs[job_id])
 
+    task = asyncio.create_task(_run_translation_job(job_id, request))
+    _bg_tasks.add(task)
+    _active_translations[job_id] = task
+    task.add_done_callback(lambda t: _on_translation_done(job_id, t))
+
+    return TranslateResponse(
+        job_id=job_id,
+        status="processing",
+        progress=0.0,
+        total_runs=len(request.runs),
+        translated_runs=[],
+    )
+
+
+async def _run_translation_job(job_id: str, request: TranslationRequest) -> None:
+    """Translate one job's runs, reporting progress on the job as it goes.
+
+    Detached from the request that started it: results are read back from the job
+    record, and a crash is recorded by the task's done-callback
+    (_on_translation_done) so a job can never hang at "processing" forever.
+    """
     # Remember wall-clock start for completion notifications
     _job_started_at[job_id] = time.monotonic()
 
@@ -429,6 +493,22 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
 
     # Prepare texts for batch translation
     texts_to_translate = [(run.run_id, run.text) for run in request.runs]
+
+    # Coalesced run groups carry the run-index range they cover, so the injector
+    # knows to write the translation into the first run and blank the rest. The
+    # spans come from the extraction stored on the job rather than from the
+    # client payload: a client that re-posts runs without the field would lose
+    # the span, and the merged translation would then be written next to the
+    # source fragments instead of replacing them.
+    stored_job = load_job(job_id)
+    span_by_run = {
+        run.run_id: run.merged_span
+        for slide in (stored_job.slides if stored_job else [])
+        for box in slide.text_boxes
+        for run in box.runs
+    }
+    for run in request.runs:
+        span_by_run.setdefault(run.run_id, run.merged_span)
     
     # Check cache first and collect uncached texts
     uncached = []
@@ -496,6 +576,12 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
     # Sanitize all translations to strip contamination + enforce glossary
     translated_runs = sanitize_translated_runs(translated_runs, request.glossary)
     
+    # Attach the coalesced run span to each unit. Done after sanitisation so a
+    # rebuild inside it cannot drop the field, and in one place so both the
+    # cache-hit and the freshly-translated branches stay untouched.
+    for tr in translated_runs:
+        tr.merged_span = span_by_run.get(tr.run_id)
+
     # Update job progress
     jobs[job_id].translated_runs = translated_runs
     jobs[job_id].progress = 100.0
@@ -523,23 +609,39 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
             failed_count,
         )
 
-    return TranslateResponse(
-        job_id=job_id,
-        status="completed",
-        progress=100.0,
-        total_runs=len(request.runs),
-        translated_runs=[tr.model_dump() for tr in translated_runs],
-    )
+    # No response object to build here: the job record (status="completed" plus
+    # translated_runs, saved just above) is what the client polls for.
+
+
+def _on_translation_done(job_id: str, task: asyncio.Task) -> None:
+    """Record a crashed background translation on the job instead of leaving it hanging.
+
+    Without this the UI would poll a job stuck at "processing" forever and the
+    exception would exist only as a line in the service journal.
+    """
+    _bg_tasks.discard(task)
+    _active_translations.pop(job_id, None)
+    if task.cancelled():
+        detail = "cancelled"
+    else:
+        error = task.exception()
+        if error is None:
+            return
+        detail = f"{type(error).__name__}: {error}"
+    print(f"  [JOB {job_id}] translation failed: {detail}")
+    job = jobs.get(job_id) or load_job(job_id)
+    if job is None:
+        return
+    job.status = "failed"
+    job.error = detail
+    jobs[job_id] = job
+    job_store.save(job)
 
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
     """Get job status. Falls back to SQLite if not in memory (post-restart)."""
-    job = jobs.get(job_id)
-    if job is None:
-        job = job_store.load(job_id)
-        if job is not None:
-            jobs[job_id] = job  # rehydrate memory
+    job = load_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     # Return full job (translated runs included) so a refreshed browser
@@ -564,10 +666,9 @@ async def export_pptx(request: ExportRequest):
     """
     job_id = request.job_id
     
-    if job_id not in jobs:
+    job = load_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
     
     if job.status != "completed":
         raise HTTPException(status_code=400, detail="Job not completed")

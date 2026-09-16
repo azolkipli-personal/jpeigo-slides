@@ -5,7 +5,7 @@ import SlidesPanel from '@/components/SlidesPanel';
 import ThemeToggle from '@/components/ThemeToggle';
 
 // --- Types ---
-interface TextRun { run_id: string; text: string; style: { font_size: number | null; font_color: string | null; font_name: string | null; bold: boolean; italic: boolean; underline: boolean; }; }
+interface TextRun { run_id: string; text: string; style: { font_size: number | null; font_color: string | null; font_name: string | null; bold: boolean; italic: boolean; underline: boolean; }; merged_span?: [number, number] | null; }
 interface TextBox { box_id: string; shape_type: string; runs: TextRun[]; constraints: { left: number; top: number; width: number; height: number; }; }
 interface Slide { slide_index: number; slide_id: number; text_boxes: TextBox[]; }
 interface UploadedDocument { job_id: string; filename: string; total_slides: number; total_text_boxes: number; total_runs: number; slides: Slide[]; }
@@ -104,6 +104,22 @@ const ja: typeof en = {
 };
 const t = (ui: UI) => ui === 'en' ? en : ja;
 
+/** Poll a job until it leaves "processing". Returns the final status, or null on timeout. */
+async function waitForJob(jobId: string, timeoutMs = 60 * 60 * 1000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status && data.status !== 'processing' && data.status !== 'pending') return data.status as string;
+      }
+    } catch { /* transient — keep waiting */ }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  return null;
+}
+
 export default function NewTranslatorPage() {
   const [ui, setUi] = useState<UI>('en');
   const [mode, setMode] = useState<'pptx' | 'slides'>('pptx');
@@ -165,6 +181,10 @@ export default function NewTranslatorPage() {
           if (glossaryTerms.trim()) body.glossary = glossaryTerms.split('\n').map(s => s.trim()).filter(Boolean);
           const trRes = await fetch('/api/translate-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
           if (!trRes.ok) throw new Error(text.translationFailed);
+          // The backend queues the translation and answers at once, so wait for the
+          // job to actually finish — exporting now would write a half-translated deck.
+          const jobStatus = await waitForJob(doc.job_id);
+          if (jobStatus !== 'completed') throw new Error(text.translationFailed);
         }
 
         // Export to blob URL for later download
@@ -199,9 +219,14 @@ export default function NewTranslatorPage() {
     setError(null);
     setLoading(true);
     try {
-      const res = await fetch(`/api/jobs/${jobId}`);
+      const res = await fetch(`/api/jobs/${jobId}?full=1`);
       if (!res.ok) throw new Error('Failed to load previous session');
       const data = await res.json();
+      // Restore rebuilds the whole editor from this response, and the status
+      // poll's trimmed shape has no slides: setting it as the document produced
+      // "undefined · undefined slides" and translating it threw
+      // "x.slides is not iterable". Refuse a document we cannot translate.
+      if (!Array.isArray(data.slides)) throw new Error('Failed to load previous session');
       setDocument(data);
       setTranslatedRuns(data.translated_runs || []);
       setProgress(data.progress || 0);
@@ -287,7 +312,15 @@ export default function NewTranslatorPage() {
     setTranslating(true); setError(null); setApiError(null); setProgress(0);
     setPreviewImages([]); setPreviewError(null);
     setRunProgress(null);
-    // Poll job status every 2s while the translate POST is in flight
+
+    const stopPolling = () => {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    };
+
+    // The backend queues the translation and answers immediately, so this poll is
+    // what reports progress and the only place a failure ever surfaces: a job that
+    // dies carries status "failed" plus the error, and would otherwise be waited on
+    // forever.
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
@@ -296,18 +329,40 @@ export default function NewTranslatorPage() {
         const d = await r.json();
         const pct = Math.round(d.progress || 0);
         setProgress(pct);
-        if (d.status === 'completed') {
-          setTranslatedRuns(d.translated_runs || []);
-          setError(null);
-          setApiError(null);
+        if (d.status === 'failed') {
+          stopPolling();
+          setRunProgress(null);
           setTranslating(false);
-          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+          setError(d.error ? `${text.translationFailed} (${d.error})` : text.translationFailed);
+          return;
+        }
+        if (d.status === 'completed') {
+          // The status endpoint deliberately carries no runs — the 2s poll has to
+          // stay cheap — so read the full record once, the same call Restore uses.
+          // Assigning runs unconditionally from the light payload is what blanked a
+          // finished translation right after it appeared.
+          let runs: TranslatedRun[] = [];
+          try {
+            const full = await fetch(`/api/jobs/${document.job_id}?full=1`);
+            if (full.ok) runs = (await full.json()).translated_runs || [];
+          } catch { /* keep whatever is already on screen */ }
+          if (runs.length > 0) {
+            setTranslatedRuns(runs);
+            const failed = runs.filter(x => x.original_text === x.translated_text && x.model_used !== 'cache');
+            setApiError(failed.length > 0 ? `${failed.length} of ${runs.length} runs couldn't be translated.` : null);
+          }
+          stopPolling();
+          setProgress(100);
+          setRunProgress(null);
+          setTranslating(false);
+          setError(null);
           generatePreview(document.job_id, document.filename);
           return;
         }
         if (d.total_runs) setRunProgress({ done: Math.round((pct / 100) * d.total_runs), total: d.total_runs });
       } catch { /* transient — next tick retries */ }
     }, 2000);
+
     try {
       const allRuns: TextRun[] = [];
       for (const slide of document.slides) for (const textBox of slide.text_boxes) allRuns.push(...textBox.runs);
@@ -318,21 +373,30 @@ export default function NewTranslatorPage() {
       const response = await fetch('/api/translate-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!response.ok) { const err = await response.json().catch(() => ({ error: text.translationFailed })); throw new Error(err.error || text.translationFailed); }
       const data = await response.json();
-      setTranslatedRuns(data.translated_runs || []);
-      const failed = (data.translated_runs || []).filter((r: TranslatedRun) => r.original_text === r.translated_text && r.model_used !== 'cache');
-      if (failed.length > 0) setApiError(`${failed.length} of ${data.translated_runs.length} runs couldn't be translated.`);
-      setProgress(100);
-
-      // Auto-generate preview images
-      generatePreview(document.job_id, document.filename);
-    } catch (err) { console.error('Frontend Translation Error:', err); setError(err instanceof Error ? (err.message || String(err)) : text.translationFailed); }
-    finally {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      // The reply only acknowledges the queue ("processing"); the runs arrive through
+      // the poll above. A duplicate click can be answered with the state of the run
+      // already in flight, which may be finished or failed by then.
+      if (data.status === 'failed') throw new Error(data.error || text.translationFailed);
+      if (data.status === 'completed' && Array.isArray(data.translated_runs) && data.translated_runs.length > 0) {
+        setTranslatedRuns(data.translated_runs);
+        const failed = data.translated_runs.filter((r: TranslatedRun) => r.original_text === r.translated_text && r.model_used !== 'cache');
+        setApiError(failed.length > 0 ? `${failed.length} of ${data.translated_runs.length} runs couldn't be translated.` : null);
+        stopPolling();
+        setProgress(100);
+        setRunProgress(null);
+        setTranslating(false);
+        generatePreview(document.job_id, document.filename);
+      }
+      // Otherwise the job is still running — the poll clears the state when it lands.
+    } catch (err) {
+      console.error('Frontend Translation Error:', err);
+      stopPolling();
       setRunProgress(null);
       setTranslating(false);
       // No error clearing here — errors are cleared at the start of the run. Clearing
-      // them in finally wiped the failure message, and the partial-failure warning set
-      // just above, the instant they were set, so neither was ever visible.
+      // them in a finally wiped the failure message, and the partial-failure warning
+      // set just below, the instant they were set, so neither was ever visible.
+      setError(err instanceof Error ? (err.message || String(err)) : text.translationFailed);
     }
   }, [document, sourceLang, targetLang, model, contextPrompt, glossaryTerms, ui]); // eslint-disable-line react-hooks/exhaustive-deps
 

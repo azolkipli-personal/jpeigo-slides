@@ -141,9 +141,19 @@ t_elem = a_t_elements[run_idx]           # run_idx came from the extractor's den
 
 SmartArt data models routinely contain empty `<a:t>` placeholder points, so the indices diverge after the first one. Result: translated text lands in the **wrong SmartArt node**, silently — it isn't a failure, so it never appears in `failed_runs`. Wrong-but-plausible output is the worst failure mode for a client deck. Fix: give extraction and injection one shared enumeration (or have extraction store the resolved node path, which it already builds at `297-305` and then throws away).
 
-### 2.5 🟠 Per-run translation fragments sentences
+### 2.5 ✅ Per-run translation fragments sentences — FIXED in v1.2.2
 
 `main.py:431` translates each run in isolation. A Japanese paragraph split into runs — routine whenever formatting changes mid-paragraph — becomes N independently-translated fragments, so grammar and terminology break across the seam, and the translation-memory cache locks those fragments in permanently. This is also the root cause of the overflow problems §2.2 and §2.3 are trying to paper over: **text length is the variable that drives overflow, and nothing in the pipeline constrains it.** Translating per paragraph with the run boundaries preserved (translate the joined paragraph, redistribute the result across runs by proportion, or ask for a run-boundary-delimited response) removes the need for most of the font-scaling hackery.
+
+**Fixed in v1.2.2 — Option 2 (coalesce formatting-identical runs), verified live.**
+
+- **Scope, measured:** of the 21 multi-run segments in `test_real.pptx`, **10 are formatting-identical** (byte-equal once PowerPoint's `dirty`/`lang`/`err`/`smtClean` hygiene attributes are normalised away) and hold 26 of the 75 multi-run runs. The other 11 are genuinely mixed — bold lead-in + normal body, highlighted runs, a 12pt footer run — and deliberately stay per-run: fusing them would change the design.
+- **Extraction** now emits one unit per identical-formatting group: **204 → 179 units**, with `merged_span: [i, j]` on the merged unit.
+- **Injector** writes the translation into run *i*, blanks `i+1..j` via `clear_run_text` (the `<a:r>` element and its `rPr` stay, so every `run_index` lookup stays valid), and refuses the write unless XML runs `i..j` re-join to exactly the stored `original_text` — mismatches surface as `X-Injection-Failed` instead of landing shifted.
+- **Guards that keep it honest:** XML-sibling adjacency (`<a:br>`/`<a:fld>` never fuse, they are invisible to python-pptx), whitespace-only runs never fuse (table column padding is layout), comparison only on normalised `rPr`.
+- **Spans are re-derived server-side** from the job's stored extraction at translate time, so a client that round-trips runs without the field cannot produce a half-merged paragraph.
+- **Result on the sample deck:** stranded per-run fragments **6 → 1**; `Ways of Working & Governance` → 働き方とガバナンス (was 方法Wワーキング&Gガバナンス), `Recap` → まとめ (was `R` + `ecap`), `Sol'n Archi` → ソリューションアーキテクチャ; injection failures 0; verifier `VIOLATIONS: none`. The single remaining fragment is a genuinely mixed table row (`'75'`: bold run + highlighted run + 12pt run), i.e. the out-of-scope class above.
+- **Verifier consequence:** deck comparison must walk runs **positionally including blanked ones**. A merged span blanks consecutive runs, so filtering empty runs out misaligns the two decks — a correct deck then reports `run count changed 5 -> 1` and compares the wrong pairs. A blanked run is legitimate only while a run above it in the same paragraph still holds text; that is the rule that separates deliberate coalescing from real text loss.
 
 ### 2.6 🟡 Nothing is verified after injection, and failures are swallowed
 
@@ -281,8 +291,12 @@ Track one number per job: **structurally-flagged run count** (Layer 1) plus **vi
 **Unit regression guard (item 15, first half) — `backend/tests/test_injector_units.py`**
 - 17 checks, all passing, no pytest needed. Each asserts the post-fix behaviour *and* demonstrates the pre-fix one, e.g. one paragraph of `test_real.pptx`: per-run scaling gave **10.5pt vs 18.0pt** in the same paragraph; paragraph scaling now gives **11.0pt to both**.
 
+**Reliability and job-record fixes (2026-09-16)**
+- **Translate no longer dies at 300 s.** Root cause: undici's `headersTimeout` in the Next proxy — the app-level `AbortSignal.timeout(...)` does not extend it. `POST /api/translate` now queues the job and returns immediately (`status=processing`); the work runs as a backend background task and the UI follows its existing 2 s poll, reading the runs with `?full=1` on completion. No hop in the chain (browser, Cloudflare, Next) spans the translation. A failure now surfaces as `status=failed` with the error text instead of a hung job. Verified: ack in 0.00 s, work continues after the client disconnects, poll 0→50→100%, export 0/20 injection failures; user-confirmed on a fresh deck.
+- **Job reads no longer depend on the in-memory dict.** One shared `load_job()` with a SQLite fallback is used by every job read. Export hard-required `jobs[job_id]` and 404'd on a job that was persisted but not in memory (`404 {"detail":"Job not found"}`) while translate tolerated the same gap. After the fix: export 200 over the public URL, injection 0/241 on the hiauto job. `?full=1` additionally lets a reloaded page restore a finished translation.
+- **§2.5 coalescing** — see §2.5: 204 → 179 units, stranded fragments 6 → 1, verifier `VIOLATIONS: none`.
+
 ### Still open
-- **§2.5 per-run translation fragmentation** (`backend/app/translators/service.py`, untouched) — "Recap (…" splits into `'R' | 'ecap ('`, so the model sees a bare `'R'` and the fragment stays English. Layer 1 now *reports* this (18 runs) but does not fix it. This is the largest remaining quality item.
 - **Font decision (§2.1)** — `JP_FONT_FAMILY` defaults to `Yu Gothic`, which is not installed here, so previews still substitute Noto. Switching to a font that exists is a config change, not a code change.
 - **SmartArt enumeration** is duplicated in extractor and injector with the same expression; a shared helper would make drift impossible rather than merely absent.
 - **Layer 2 / Layer 3** (items 11–13) and the golden-deck test's stubbed-translation half (item 15) not started.

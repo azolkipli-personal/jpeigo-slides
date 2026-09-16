@@ -45,6 +45,12 @@ class TextRun(BaseModel):
     # XML path for re-injection
     xml_path: str
 
+    # Inclusive [first, last] run-index range when adjacent, identically
+    # formatted runs were coalesced into this one translation unit. None for a
+    # normal single-run unit. The injector writes the translation into
+    # run_index and blanks the remaining runs of the span.
+    merged_span: Optional[list[int]] = None
+
 
 class TextBox(BaseModel):
     """A text box containing multiple runs."""
@@ -105,6 +111,9 @@ class TranslatedRun(BaseModel):
     # text was passed through. Identity outputs with success=True are
     # legitimate (numbers, dates, brand names).
     success: bool = True
+
+    # Mirrors TextRun.merged_span — the run-index range this unit covers.
+    merged_span: Optional[list[int]] = None
 
     # Font size adjustment if needed
     adjusted_font_size: Optional[float] = None

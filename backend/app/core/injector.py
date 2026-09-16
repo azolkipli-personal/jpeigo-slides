@@ -329,6 +329,50 @@ def inject_smartart_text(
     return failed_runs
 
 
+def clear_run_text(run) -> None:
+    """Empty a run's text while keeping the <a:r> element and its rPr intact.
+
+    Coalescing writes a whole translation into the first run of a span; the other
+    runs of that span are blanked rather than removed so every run index used by
+    other lookups in the same paragraph stays valid.
+    """
+    for t in run._r.findall(f'{{{A_NS}}}t'):
+        t.text = ''
+
+
+def span_targets(paragraph_runs: list, tr: TranslatedRun) -> tuple:
+    """Resolve which runs a translated unit should occupy.
+
+    Returns (first_run, extra_runs_to_blank). Returns (None, []) when the span
+    cannot be honoured, so the caller records an injection failure instead of
+    blanking text it cannot account for.
+    """
+    first_idx = _run_index(tr)
+    if first_idx >= len(paragraph_runs):
+        return None, []
+
+    first_run = paragraph_runs[first_idx]
+
+    span = tr.merged_span
+    if not span or len(span) < 2:
+        return first_run, []
+
+    last_idx = int(span[1])
+    if last_idx <= first_idx or last_idx >= len(paragraph_runs):
+        return None, []
+
+    span_runs = paragraph_runs[first_idx:last_idx + 1]
+    joined = ''.join(r.text for r in span_runs)
+    if joined != tr.original_text:
+        print(
+            f"  [INJECTOR] refusing merged span {span} on {tr.run_id}: source text "
+            f"does not match ({joined!r} != {tr.original_text!r})"
+        )
+        return None, []
+
+    return first_run, span_runs[1:]
+
+
 def replace_text_in_shape(
     shape: Shape,
     translated_runs: list[TranslatedRun],
@@ -377,10 +421,13 @@ def replace_text_in_shape(
                 
                 cell = table.rows[table_row].cells[table_col]
                 paragraph_idx = int(run_parts[3]) if len(run_parts) > 3 else 0
-                run_offset = int(run_parts[4]) if len(run_parts) > 4 else 0
                 
                 para = list(cell.text_frame.paragraphs)[paragraph_idx]
-                run = list(para.runs)[run_offset]
+                para_runs = list(para.runs)
+                run, extra_runs = span_targets(para_runs, translated_run)
+                if run is None:
+                    failed_runs.append(translated_run)
+                    continue
                 
                 try:
                     orig_font_size = run.font.size
@@ -390,6 +437,8 @@ def replace_text_in_shape(
                 para_scale = para_scales.get(_paragraph_key(translated_run), 1.0)
                 
                 set_run_text_safe(run, translated_run.translated_text, translated_run.target_language)
+                for blank_run in extra_runs:
+                    clear_run_text(blank_run)
                 
                 adjusted_size = resolve_font_size(translated_run, para_scale, orig_font_size)
                 if adjusted_size:
@@ -438,11 +487,9 @@ def replace_text_in_shape(
                 print(f"  [INJECTOR] paragraph-level scale {para_scale:.3f} on para {para_idx_str} of shape {shape_idx}")
             
             for tr in runs:
-                run_idx = _run_index(tr)
+                run, extra_runs = span_targets(paragraph_runs, tr)
                 
-                if run_idx < len(paragraph_runs):
-                    run = paragraph_runs[run_idx]
-                    
+                if run is not None:
                     # Read original font size to preserve
                     orig_font_size = None
                     try:
@@ -452,6 +499,9 @@ def replace_text_in_shape(
                         pass
                     
                     set_run_text_safe(run, tr.translated_text, tr.target_language)
+                    # Coalesced unit: the rest of the span is blanked on purpose.
+                    for blank_run in extra_runs:
+                        clear_run_text(blank_run)
                     
                     adjusted_size = resolve_font_size(tr, para_scale, orig_font_size)
                     if adjusted_size:

@@ -29,8 +29,26 @@ export async function POST(request: NextRequest) {
 
     if (!response.ok) {
       const error = await response.text();
+      // A job record that no longer exists (cleared store, expired session)
+      // used to surface as raw JSON: Export error: {"detail":"Job not found"}.
+      // Nothing there tells the user what to do, so say it.
+      if (response.status === 404) {
+        return NextResponse.json(
+          {
+            error:
+              'This session is no longer on the server (its job was cleared), so there is nothing to export. Re-upload the file and translate again.',
+          },
+          { status: 404 }
+        );
+      }
+      let detail = error;
+      try {
+        detail = (JSON.parse(error) as { detail?: string })?.detail ?? error;
+      } catch {
+        /* not JSON — keep the raw text */
+      }
       return NextResponse.json(
-        { error: `Export error: ${error}` },
+        { error: `Export error: ${detail}` },
         { status: response.status }
       );
     }

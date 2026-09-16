@@ -13,7 +13,8 @@ Checks are structural and deterministic — no AI, no network in offline mode:
 
   * slide count preserved
   * every paragraph keeps its run count (runs neither merged nor dropped)
-  * no run that held text was silently emptied
+  * no run that held text was silently emptied (a run blanked by run
+    coalescing counts as absorbed when the run before it still holds text)
   * Japanese runs carry <a:ea> (without it the CJK font override is cosmetic)
   * runs within one paragraph share a font size (per-paragraph scale)
   * translation coverage: runs still holding source text are listed
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import uuid
 import urllib.request
 from dataclasses import dataclass, field
@@ -103,12 +105,15 @@ def _smartart_texts(shape) -> list[str]:
 
 def _walk_text_frame(text_frame, deck: Deck, slide_idx: int, key_prefix: str) -> None:
     for para_idx, para in enumerate(text_frame.paragraphs):
-        runs = [r for r in para.runs if (r.text or '').strip()]
+        # Record every run, empty ones included: coalescing blanks the runs it
+        # absorbs, and dropping those records would misalign the two decks so the
+        # positional checks below compare the wrong pairs.
+        runs = list(para.runs)
         if not runs:
             continue
         key = (slide_idx, key_prefix, para_idx)
         for run in runs:
-            deck.add(key, run.text, _run_size(run), _run_has_ea(run))
+            deck.add(key, run.text or '', _run_size(run), _run_has_ea(run))
 
 
 def _walk(shapes, deck: Deck, slide_idx: int, prefix: str = '') -> None:
@@ -153,9 +158,11 @@ def inspect_deck(deck: Deck) -> dict:
     multi_run_paragraphs = 0
 
     for key, runs in deck.paragraphs.items():
-        if len(runs) > 1:
+        # Metrics describe runs that hold text: blanked runs render nothing.
+        visible = [r for r in runs if r.text.strip()]
+        if len(visible) > 1:
             multi_run_paragraphs += 1
-            sizes = {r.size for r in runs}
+            sizes = {r.size for r in visible}
             if len(sizes) > 1 and None not in sizes:
                 mixed_paragraphs += 1
         for record in runs:
@@ -169,7 +176,7 @@ def inspect_deck(deck: Deck) -> dict:
     return {
         'slides': deck.slides,
         'paragraphs': len(deck.paragraphs),
-        'runs': sum(len(v) for v in deck.paragraphs.values()),
+        'runs': sum(1 for v in deck.paragraphs.values() for r in v if r.text.strip()),
         'ja_runs': ja_runs,
         'ja_without_ea': ja_without_ea,
         'multi_run_paragraphs': multi_run_paragraphs,
@@ -191,6 +198,7 @@ def compare(original: Deck, translated: Deck) -> tuple[list[str], list[str], dic
         violations.append(f'{len(missing)} paragraphs disappeared, e.g. {sorted(missing)[:3]}')
 
     emptied = 0
+    coalesced_blank = 0
     leftovers = 0
     total_runs = 0
     ja_runs = 0
@@ -201,7 +209,7 @@ def compare(original: Deck, translated: Deck) -> tuple[list[str], list[str], dic
         new_runs = translated.paragraphs.get(key)
         if new_runs is None:
             continue
-        total_runs += len(orig_runs)
+        total_runs += sum(1 for r in orig_runs if r.text.strip())
 
         if len(new_runs) != len(orig_runs):
             violations.append(
@@ -210,9 +218,20 @@ def compare(original: Deck, translated: Deck) -> tuple[list[str], list[str], dic
             )
             continue
 
+        text_seen = False
         for o, n in zip(orig_runs, new_runs):
-            if o.text.strip() and not n.text.strip():
-                emptied += 1
+            if n.text.strip():
+                text_seen = True
+            elif o.text.strip():
+                # Runs with identical formatting inside one paragraph are
+                # translated as one unit: the translation lands in the first run
+                # of the span and the rest are blanked. Legitimate only while a
+                # run above it in the paragraph still holds text — otherwise the
+                # source text is simply gone.
+                if text_seen:
+                    coalesced_blank += 1
+                else:
+                    emptied += 1
             if n.text.strip() and n.text == o.text and has_cjk(o.text) is False:
                 leftovers += 1
             if has_cjk(n.text):
@@ -222,8 +241,10 @@ def compare(original: Deck, translated: Deck) -> tuple[list[str], list[str], dic
 
         # Runs of one paragraph should share a single font size when they started
         # out uniform — a per-run scale splits them.
-        orig_sizes = {r.size for r in orig_runs}
-        new_sizes = {r.size for r in new_runs}
+        # Only runs holding text can show a visible size split: a run blanked by
+        # run coalescing renders nothing, so its size is meaningless here.
+        orig_sizes = {r.size for r in orig_runs if r.text.strip()}
+        new_sizes = {r.size for r in new_runs if r.text.strip()}
         if len(orig_sizes) == 1 and len(new_sizes) > 1:
             size_splits.append(
                 f'slide {key[0]} shape {key[1]} para {key[2]}: '
@@ -232,6 +253,11 @@ def compare(original: Deck, translated: Deck) -> tuple[list[str], list[str], dic
 
     if emptied:
         violations.append(f'{emptied} runs lost their text (were non-empty, now empty)')
+    if coalesced_blank:
+        warnings.append(
+            f'{coalesced_blank} runs blanked by run coalescing '
+            f'(absorbed into the preceding run of the same span)'
+        )
     if size_splits:
         violations.append(
             f'{len(size_splits)} paragraphs gained mixed font sizes: ' + '; '.join(size_splits[:3])
@@ -284,6 +310,29 @@ def _post_json(url: str, payload: dict, timeout: int = 1800):
         return response.headers, response.read()
 
 
+def _wait_for_runs(base_url: str, job_id: str, timeout: int = 3600) -> list:
+    """Poll a job until it leaves 'processing', then return its translated runs.
+
+    /api/translate queues the work and answers immediately, so the runs have to be
+    read back from the job record — the POST body carries none of them.
+    """
+    deadline = time.time() + timeout
+    last_status = None
+    while time.time() < deadline:
+        with urllib.request.urlopen(f'{base_url}/api/jobs/{job_id}', timeout=30) as response:
+            job = json.loads(response.read())
+        status = job.get('status')
+        if status != last_status:
+            print(f'      job status={status}  progress={job.get("progress")}')
+            last_status = status
+        if status == 'completed':
+            return job.get('translated_runs') or []
+        if status == 'failed':
+            raise SystemExit(f'job failed: {job.get("error")}')
+        time.sleep(3)
+    raise SystemExit(f'job {job_id} did not finish within {timeout}s')
+
+
 def live_roundtrip(base_url: str, source: Path, out_path: Path, model: str) -> Path:
     print(f'[1/3] uploading {source.name}')
     document = _post_multipart(f'{base_url}/api/upload', source.name, source.read_bytes())
@@ -304,7 +353,9 @@ def live_roundtrip(base_url: str, source: Path, out_path: Path, model: str) -> P
         'model': model,
         'job_id': job_id,
     })
-    translated = json.loads(body).get('translated_runs', [])
+    ack = json.loads(body)
+    print(f'      queued: status={ack.get("status")} (runs are read back from the job)')
+    translated = _wait_for_runs(base_url, job_id)
     (out_path.parent / 'translated_runs.json').write_text(json.dumps(translated, ensure_ascii=False, indent=2))
     changed = sum(1 for r in translated if r['original_text'] != r['translated_text'])
     failed = [r for r in translated if not r.get('success', True)]

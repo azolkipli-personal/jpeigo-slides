@@ -9,6 +9,7 @@ from pptx.shapes.graphfrm import GraphicFrame
 from pptx.table import Table
 from pptx.text.text import TextFrame
 from pptx.util import Pt
+from pptx.oxml.ns import qn
 from lxml import etree
 from typing import Optional
 import uuid
@@ -192,6 +193,99 @@ def get_xml_path(run) -> str:
         return ""
 
 
+# Run attributes that do not affect how text renders. PowerPoint writes them
+# unevenly across the runs of one sentence ('Workshop ' carries no lang while 'R'
+# carries lang="en-US"), and comparing them verbatim blocked every merge.
+# dirty/smtClean/err are editing hygiene; lang/altLang stop mattering once the
+# injector sets the latin/ea typefaces for the target language.
+IGNORED_RUN_ATTRS = frozenset({'dirty', 'smtClean', 'err', 'lang', 'altLang'})
+
+
+def _rpr_signature(run) -> str:
+    """Fingerprint a run's <a:rPr>, ignoring edit hygiene.
+
+    An absent rPr is a real state (the run inherits everything), so it gets its
+    own sentinel instead of comparing equal to an empty element.
+    """
+    try:
+        rPr = run._r.find(qn('a:rPr'))
+    except Exception:
+        return '<unreadable>'
+    if rPr is None:
+        return '<inherited>'
+
+    attrs = ' '.join(
+        f'{key}={value}'
+        for key, value in sorted(rPr.attrib.items())
+        if key not in IGNORED_RUN_ATTRS
+    )
+    children = ''.join(
+        etree.tostring(child, with_tail=False).decode('utf-8', 'replace')
+        for child in rPr
+    )
+    return f'<{attrs}>{children}'
+
+
+def _xml_adjacent(left, right) -> bool:
+    """True when nothing sits between two runs in the paragraph XML.
+
+    <a:br> and <a:fld> are not exposed as runs by python-pptx, so runs on either
+    side of a line break look consecutive in `paragraph.runs`. Merging them would
+    collapse the break, so adjacency is checked on the XML child list.
+    """
+    try:
+        kids = list(left._r.getparent())
+        return kids.index(right._r) - kids.index(left._r) == 1
+    except (AttributeError, ValueError):
+        return False
+
+
+def _padding_between(left, right) -> bool:
+    """True when merging these runs would collapse deliberate spacing.
+
+    Table cells pad columns with runs of spaces, so spacing there is layout and
+    not prose. A model handed one whole string may normalise whitespace inside it,
+    which would move the columns; keeping those runs apart leaves them as-is.
+    """
+    if '  ' in left.text or '  ' in right.text:
+        return True
+    return left.text.endswith((' ', '\t')) and right.text.startswith((' ', '\t'))
+
+
+def _coalesce_groups(para_runs):
+    """Group runs with identical formatting so a sentence is translated whole.
+
+    PowerPoint and copy/paste split one sentence into several <a:r> runs the
+    author never saw ('W' + 'orking'), and every run used to be its own model job,
+    so 'W' came back untranslated. Runs that are XML-adjacent, hold non-whitespace
+    text and share a formatting fingerprint merge into one unit; the merge cannot
+    change the look because the formatting was already the same. Whitespace-only
+    runs are never merged, so padding stays where the author put it.
+    """
+    groups = []
+    first = None
+    sig = None
+    for idx, run in enumerate(para_runs):
+        if not run.text.strip():
+            if first is not None:
+                groups.append((first, idx - 1))
+                first = None
+                sig = None
+            continue
+        cur = _rpr_signature(run)
+        if (first is not None and cur == sig
+                and _xml_adjacent(para_runs[idx - 1], run)
+                and not _padding_between(para_runs[idx - 1], run)):
+            continue
+        if first is not None:
+            groups.append((first, idx - 1))
+        first = idx
+        sig = cur
+    if first is not None:
+        groups.append((first, len(para_runs) - 1))
+    return groups
+
+
 def extract_runs_from_text_frame(
     text_frame: TextFrame,
     slide_idx: int,
@@ -213,23 +307,27 @@ def extract_runs_from_text_frame(
     effective_run_id_idx = run_id_shape_idx if run_id_shape_idx is not None else shape_idx
     
     for para_idx, paragraph in enumerate(text_frame.paragraphs):
-        for run_idx, run in enumerate(paragraph.runs):
-            if not run.text.strip():
-                continue
-            
+        para_runs = list(paragraph.runs)
+        for first_idx, last_idx in _coalesce_groups(para_runs):
+            run = para_runs[first_idx]
+            # One translation unit per run group: the concatenated text goes to
+            # the model as a whole sentence instead of word fragments.
+            text = "".join(r.text for r in para_runs[first_idx:last_idx + 1])
+
             style = extract_style_from_run(run)
             xml_path = get_xml_path(run)
-            run_id = generate_run_id(slide_idx, effective_run_id_idx, para_idx, run_idx)
-            
+            run_id = generate_run_id(slide_idx, effective_run_id_idx, para_idx, first_idx)
+
             text_run = TextRun(
                 run_id=run_id,
-                text=run.text,
+                text=text,
                 style=style,
                 slide_index=slide_idx,
                 shape_index=shape_idx,
                 paragraph_index=para_idx,
-                run_index=run_idx,
+                run_index=first_idx,
                 xml_path=xml_path,
+                merged_span=[first_idx, last_idx] if last_idx > first_idx else None,
             )
             runs.append(text_run)
     
