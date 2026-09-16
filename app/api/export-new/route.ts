@@ -50,6 +50,14 @@ export async function POST(request: NextRequest) {
       headers: {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
         'Content-Disposition': contentDisposition,
+        // Injection failures are reported by the backend as headers (the body is
+        // the PPTX). Re-emit them or the UI can never see a partial export.
+        ...(response.headers.get('X-Injection-Failed')
+          ? {
+              'X-Injection-Failed': response.headers.get('X-Injection-Failed') as string,
+              'X-Injection-Total': response.headers.get('X-Injection-Total') as string,
+            }
+          : {}),
       },
     });
 

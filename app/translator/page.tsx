@@ -296,6 +296,15 @@ export default function NewTranslatorPage() {
         const d = await r.json();
         const pct = Math.round(d.progress || 0);
         setProgress(pct);
+        if (d.status === 'completed') {
+          setTranslatedRuns(d.translated_runs || []);
+          setError(null);
+          setApiError(null);
+          setTranslating(false);
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+          generatePreview(document.job_id, document.filename);
+          return;
+        }
         if (d.total_runs) setRunProgress({ done: Math.round((pct / 100) * d.total_runs), total: d.total_runs });
       } catch { /* transient — next tick retries */ }
     }, 2000);
@@ -316,11 +325,14 @@ export default function NewTranslatorPage() {
 
       // Auto-generate preview images
       generatePreview(document.job_id, document.filename);
-    } catch (err) { setError(err instanceof Error ? err.message : text.translationFailed); }
+    } catch (err) { console.error('Frontend Translation Error:', err); setError(err instanceof Error ? (err.message || String(err)) : text.translationFailed); }
     finally {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       setRunProgress(null);
       setTranslating(false);
+      // No error clearing here — errors are cleared at the start of the run. Clearing
+      // them in finally wiped the failure message, and the partial-failure warning set
+      // just above, the instant they were set, so neither was ever visible.
     }
   }, [document, sourceLang, targetLang, model, contextPrompt, glossaryTerms, ui]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -330,6 +342,10 @@ export default function NewTranslatorPage() {
     try {
       const response = await fetch('/api/export-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: document.job_id, filename: `translated_${document.filename}` }) });
       if (!response.ok) { const err = await response.json().catch(() => ({ error: text.exportFailed })); throw new Error(err.error || text.exportFailed); }
+      // The export body is the PPTX, so injection failures arrive as headers.
+      const injectionFailures = Number(response.headers.get('X-Injection-Failed') || 0);
+      const injectionTotal = Number(response.headers.get('X-Injection-Total') || 0);
+      setApiError(injectionFailures > 0 ? `${injectionFailures} of ${injectionTotal} text runs could not be placed in the exported deck.` : null);
       const blob = await response.blob(); const url = window.URL.createObjectURL(blob);
       const a = window.document.createElement('a'); a.href = url; a.download = `translated_${document.filename}`;
       window.document.body.appendChild(a); a.click(); window.document.body.removeChild(a); window.URL.revokeObjectURL(url);

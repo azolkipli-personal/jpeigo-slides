@@ -10,6 +10,7 @@ from pptx.text.text import TextFrame
 from pptx.util import Pt, Emu
 from typing import Optional
 import copy
+import os
 from lxml import etree
 
 from app.models import TranslatedRun, TranslationJob, SpatialConstraints
@@ -23,6 +24,15 @@ PPTX_NS = {
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
     'dgm': 'http://schemas.openxmlformats.org/drawingml/2006/diagram',
 }
+
+A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+# Typeface written for Japanese output. python-pptx's font.name only sets
+# <a:latin>, which does not drive CJK glyph selection, so the previous override
+# was cosmetic for Japanese text. Override with JP_FONT_FAMILY — set it to a font
+# the preview renderer actually has ('Noto Sans JP') to make previews truthful,
+# since Yu Gothic is not installed on Linux.
+JP_FONT_FAMILY = os.environ.get('JP_FONT_FAMILY', 'Yu Gothic')
 
 
 # Average character widths for font size estimation
@@ -54,6 +64,52 @@ def calculate_font_scale(original_text: str, translated_text: str) -> float:
     
     scale = orig_width / trans_width
     return max(scale, 0.5)  # Don't go below 50%
+
+
+def _run_index(tr: TranslatedRun) -> int:
+    """Run index within its paragraph, from the run_id layout
+    run_<slide>_<shape path>_<paragraph>_<run>_<counter>."""
+    parts = tr.run_id.split('_')
+    return int(parts[4]) if len(parts) > 4 else 0
+
+
+def _paragraph_key(tr: TranslatedRun) -> str:
+    """Identity of the paragraph a run belongs to.
+
+    parts[2] is the shape path and parts[3] the paragraph index, so this groups
+    table-cell runs too — their path encodes shape.table.row.col.
+    """
+    parts = tr.run_id.split('_')
+    return f"{parts[2] if len(parts) > 2 else '0'}|{parts[3] if len(parts) > 3 else '0'}"
+
+
+def paragraph_font_scale(group: list[TranslatedRun]) -> float:
+    """One font scale for a whole paragraph.
+
+    Scaling each run from its own fragment gives runs in the same paragraph
+    different sizes, because every fragment has its own original:translated width
+    ratio. The scale has to come from the paragraph's combined text.
+    """
+    if not any(tr.target_language == 'ja' for tr in group):
+        return 1.0
+    ordered = sorted(group, key=_run_index)
+    original = ''.join(tr.original_text for tr in ordered)
+    translated = ''.join(tr.translated_text for tr in ordered)
+    return calculate_font_scale(original, translated)
+
+
+def resolve_font_size(tr: TranslatedRun, para_scale: float, orig_font_size) -> Optional[float]:
+    """Smallest of the fit-derived size and the paragraph-scaled size.
+
+    Taking the minimum stops the paragraph scale from overwriting
+    adjusted_font_size (the geometry-fit result), which used to be discarded.
+    """
+    candidates = []
+    if tr.adjusted_font_size:
+        candidates.append(tr.adjusted_font_size)
+    if para_scale < 1.0 and orig_font_size:
+        candidates.append(orig_font_size.pt * para_scale)
+    return min(candidates) if candidates else None
 
 
 def estimate_text_width(text: str, font_size: float) -> float:
@@ -112,10 +168,31 @@ def check_text_fit(
     return True, None, None
 
 
+def set_run_typefaces(run, typeface: str) -> None:
+    """Apply a typeface to the latin, east-asian and complex-script slots.
+
+    CT_TextCharacterProperties requires the order latin < ea < cs, so each
+    element is inserted directly after the previous one.
+    """
+    run.font.name = typeface  # creates <a:latin> in the schema-correct position
+    rPr = run._r.get_or_add_rPr()
+    prev = rPr.find(f'{{{A_NS}}}latin')
+    for tag in ('ea', 'cs'):
+        el = rPr.find(f'{{{A_NS}}}{tag}')
+        if el is None:
+            el = rPr.makeelement(f'{{{A_NS}}}{tag}', {})
+            if prev is not None:
+                prev.addnext(el)
+            else:
+                rPr.append(el)
+        el.set('typeface', typeface)
+        prev = el
+
+
 def set_run_text_safe(run, new_text: str, target_language: str = 'en'):
     """
     Safely set text on a run, preserving all formatting.
-    Switches font to Yu Gothic if target is Japanese.
+    Applies the configured Japanese typeface when the target is Japanese.
     """
     # Store original properties
     original_font = run.font
@@ -142,10 +219,11 @@ def set_run_text_safe(run, new_text: str, target_language: str = 'en'):
     except Exception:
         pass  # Some properties might not be settable
 
-    # Switch to Yu Gothic for Japanese target text (overrides original font)
+    # Override the typeface for Japanese target text, including the East Asian
+    # slot — <a:latin> alone does not control CJK glyph selection.
     if target_language == 'ja':
         try:
-            run.font.name = 'Yu Gothic'
+            set_run_typefaces(run, JP_FONT_FAMILY)
         except Exception:
             pass
 
@@ -219,30 +297,29 @@ def inject_smartart_text(
         
         dgm_xml = etree.fromstring(dgm_part.blob)
         
-        a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        # Snapshot the text nodes once, in document order, skipping empties — the
+        # same order the extractor used. The extractor skips empty <a:t> while this
+        # code did not, so every node past the first empty one received another
+        # node's translation, silently. Snapshotting also stops the indices from
+        # shifting when a translated string is empty.
+        a_t_elements = [t for t in dgm_xml.iter(f'{{{A_NS}}}t') if (t.text or '').strip()]
+        placed = 0
         
         for tr in translated_runs:
             try:
                 run_parts = tr.run_id.split('_')
                 run_idx = int(run_parts[4]) if len(run_parts) > 4 else 0
                 
-                # Find the corresponding <a:t> element in the data model
-                # Scan through all <dgm:pt> → <a:t> elements
-                a_t_elements = []
-                for pt in dgm_xml.iter(f'{{{PPTX_NS["dgm"]}}}pt'):
-                    for t_elem in pt.iter(f'{{{a_ns}}}t'):
-                        a_t_elements.append(t_elem)
-                
                 if run_idx < len(a_t_elements):
-                    t_elem = a_t_elements[run_idx]
-                    t_elem.text = tr.translated_text
+                    a_t_elements[run_idx].text = tr.translated_text
+                    placed += 1
                 else:
                     failed_runs.append(tr)
             except Exception:
                 failed_runs.append(tr)
         
         # Write back modified XML
-        if len(failed_runs) < len(translated_runs):
+        if placed:
             dgm_part._blob = etree.tostring(dgm_xml, xml_declaration=True, encoding='UTF-8')
         
     except Exception as e:
@@ -280,6 +357,13 @@ def replace_text_in_shape(
     # Handle tables
     if isinstance(shape, GraphicFrame) and shape.has_table:
         table = shape.table
+        
+        # Resolve one scale per cell-paragraph up front (see paragraph_font_scale).
+        para_groups: dict[str, list[TranslatedRun]] = {}
+        for translated_run in translated_runs:
+            para_groups.setdefault(_paragraph_key(translated_run), []).append(translated_run)
+        para_scales = {key: paragraph_font_scale(group) for key, group in para_groups.items()}
+        
         for translated_run in translated_runs:
             try:
                 run_parts = translated_run.run_id.split('_')
@@ -303,18 +387,11 @@ def replace_text_in_shape(
                 except Exception:
                     orig_font_size = None
                 
-                # Auto-scale font if translating to Japanese
-                scale = 1.0
-                if translated_run.target_language == 'ja':
-                    scale = calculate_font_scale(translated_run.original_text, translated_run.translated_text)
-                    if scale < 1.0 and orig_font_size:
-                        print(f"  [INJECTOR] scaling table font {orig_font_size.pt:.1f}pt → {orig_font_size.pt * scale:.1f}pt for run {translated_run.run_id}")
+                para_scale = para_scales.get(_paragraph_key(translated_run), 1.0)
                 
                 set_run_text_safe(run, translated_run.translated_text, translated_run.target_language)
                 
-                adjusted_size = translated_run.adjusted_font_size
-                if scale < 1.0 and orig_font_size:
-                    adjusted_size = orig_font_size.pt * scale
+                adjusted_size = resolve_font_size(translated_run, para_scale, orig_font_size)
                 if adjusted_size:
                     run.font.size = Pt(adjusted_size)
                         
@@ -354,9 +431,14 @@ def replace_text_in_shape(
             paragraph = paragraphs[para_idx]
             paragraph_runs = list(paragraph.runs)
             
+            # One scale for the whole paragraph — per-run scaling made runs of the
+            # same paragraph different sizes.
+            para_scale = paragraph_font_scale(runs)
+            if para_scale < 1.0:
+                print(f"  [INJECTOR] paragraph-level scale {para_scale:.3f} on para {para_idx_str} of shape {shape_idx}")
+            
             for tr in runs:
-                run_i_parts = tr.run_id.split('_')
-                run_idx = int(run_i_parts[4]) if len(run_i_parts) > 4 else 0
+                run_idx = _run_index(tr)
                 
                 if run_idx < len(paragraph_runs):
                     run = paragraph_runs[run_idx]
@@ -369,19 +451,9 @@ def replace_text_in_shape(
                     except Exception:
                         pass
                     
-                    # Auto-scale font if translating to Japanese (CJK wider per char)
-                    scale = 1.0
-                    if tr.target_language == 'ja':
-                        scale = calculate_font_scale(tr.original_text, tr.translated_text)
-                        if scale < 1.0 and orig_font_size:
-                            print(f"  [INJECTOR] scaling font {orig_font_size.pt:.1f}pt → {orig_font_size.pt * scale:.1f}pt for run {tr.run_id}")
-                    
                     set_run_text_safe(run, tr.translated_text, tr.target_language)
                     
-                    # Apply font size adjustment if explicitly set (from check_text_fit logic)
-                    adjusted_size = tr.adjusted_font_size
-                    if scale < 1.0 and orig_font_size:
-                        adjusted_size = orig_font_size.pt * scale
+                    adjusted_size = resolve_font_size(tr, para_scale, orig_font_size)
                     if adjusted_size:
                         run.font.size = Pt(adjusted_size)
                 else:

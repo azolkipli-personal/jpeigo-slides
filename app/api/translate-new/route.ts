@@ -20,7 +20,7 @@ export async function POST(request: NextRequest) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(20 * 60 * 1000),
+      signal: AbortSignal.timeout(30 * 60 * 1000),
     });
 
     if (!response.ok) {

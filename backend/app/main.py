@@ -593,7 +593,9 @@ async def export_pptx(request: ExportRequest):
         )
         
         if not success:
-            # Log failed runs
+            # Injection failures used to be printed and the file served anyway, so a
+            # partially-translated deck looked like a clean export. Surface the count
+            # to the UI via headers, since the response body is the PPTX itself.
             for run in failed:
                 print(f"Failed to inject: {run.run_id}")
         
@@ -602,6 +604,11 @@ async def export_pptx(request: ExportRequest):
             path=str(output_path),
             filename=output_filename,
             media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            headers={
+                "X-Injection-Failed": str(len(failed)),
+                "X-Injection-Total": str(len(job.translated_runs)),
+                "Access-Control-Expose-Headers": "X-Injection-Failed, X-Injection-Total",
+            },
         )
         
     except Exception as e:

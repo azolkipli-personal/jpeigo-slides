@@ -287,11 +287,13 @@ def extract_smartart_text(
         # We extract from <a:t> which contains the actual text
         a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
         text_idx = 0
-        for pt in dgm_xml.iter(f'{{{PPTX_NAMESPACES["dgm"]}}}pt'):
-            for t_elem in pt.iter(f'{{{a_ns}}}t'):
-                text = (t_elem.text or '').strip()
-                if not text:
-                    continue
+        # Walk <a:t> in document order and skip empties. The previous pt-then-t
+        # walk visited some nodes twice when <dgm:pt> nested, and the injector
+        # matches this expression exactly, so index alignment depends on it.
+        for t_elem in dgm_xml.iter(f'{{{a_ns}}}t'):
+            text = (t_elem.text or '').strip()
+            if not text:
+                continue
                 
                 # Build XML path for re-injection
                 parts = []
