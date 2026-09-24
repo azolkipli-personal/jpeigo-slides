@@ -68,7 +68,7 @@ def deck_slide_count(pptx_path) -> int | None:
 
 ISSUE_TYPES = (
     'text_overflow', 'clipping', 'overlap', 'misalignment',
-    'missing_glyph', 'cramped', 'empty_placeholder', 'other',
+    'missing_glyph', 'cramped', 'empty_placeholder', 'bad_wrap', 'other',
 )
 
 PROMPT = """You are reviewing the layout of a presentation slide.
@@ -84,6 +84,12 @@ Report only layout damage that is visible in the image:
 - missing_glyph: blank boxes, tofu, or unreadable substitutes standing in for characters
 - cramped: text is visibly squeezed against a border, or its line spacing has collapsed
 - empty_placeholder: a shape that should clearly hold text is blank
+- bad_wrap: awkward single-character line wraps — a trailing punctuation mark \
+(period, comma) or a lone character/kanji forced alone onto a new line
+
+When an issue looks caused by the translated text being too long for its box \
+(English runs ~1.6x the length of Japanese), say so in "detail" — that points \
+the fix at shortening the line rather than resizing the design.
 
 Do not comment on wording, translation quality, or language choice — a separate \
 review covers that. A slide with no layout damage must come back as "ok"; do not \
@@ -92,7 +98,9 @@ invent issues to seem useful. Small aesthetic opinions are not issues.
 Answer with JSON only, no prose:
 {{"verdict": "ok" | "minor" | "broken",
   "issues": [{{"type": "{types}", "severity": "low" | "medium" | "high",
-             "where": "the shape or text involved",
+             "where": "anchor the damage with a location reference the reader \
+can find fast — the shape name, the table column number, or a coarse position \
+(e.g. 'red bar, left 30%', 'table col 3', 'title box'), not just the shape name alone",
              "detail": "what is wrong, in one sentence"}}],
   "summary": "one sentence on this slide's layout"}}
 """.replace('{types}', ' | '.join(ISSUE_TYPES))
