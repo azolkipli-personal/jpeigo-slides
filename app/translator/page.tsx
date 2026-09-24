@@ -179,7 +179,7 @@ export default function NewTranslatorPage() {
   const [dragOver, setDragOver] = useState(false);
   const [sourceLang, setSourceLang] = useState<'ja' | 'en'>('en');
   const [targetLang, setTargetLang] = useState<'ja' | 'en'>('ja');
-  const [model, setModel] = useState<string>('gemini-25-flash-lite');
+  const [model, setModel] = useState<string>('gemini-flash-38');
   // The catalog decides what the pickers offer, so a list edit in the backend shows
   // up here without touching this file.
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);

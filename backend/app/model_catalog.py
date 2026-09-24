@@ -50,7 +50,9 @@ class VisionModel(NamedTuple):
     """One model that can be asked to look at a rendered slide.
 
     No registry key: the slide check passes the provider model ID straight to
-    `qa/client.py`, which routes by lane.
+    `qa/client.py`, which routes by lane. The lane itself is derived from the
+    model ID the same way `qa/client.lane_for` derives it — a Gemini ID must
+    report `gemini` so the key check asks for GEMINI_API_KEY, not OpenCode's.
     """
 
     model: str
@@ -58,37 +60,44 @@ class VisionModel(NamedTuple):
     note: str = ''
 
     def as_dict(self) -> dict:
-        return {'key': self.model, 'label': self.label, 'lane': 'opencode',
+        return {'key': self.model, 'label': self.label,
+                'lane': 'gemini' if self.model.startswith('gemini') else 'opencode',
                 'model': self.model, 'note': self.note}
 
 
-# Translation picker. Ordered cheapest-first so the recommended entry leads. The
-# OpenCode entries carry their real per-1M-token price, because that plan's limit
-# is a dollar amount per model — nothing here is flat-rate.
+# Translation picker: 12 entries, recommended first, then the newest flash tier
+# per family. Every key here also exists in `TranslationService.translators`, so a
+# saved selection keeps resolving even when the model behind a key is retargeted
+# (opencode-qwen: 3.8 Max → 3.8 Flash, opencode-glm: 5.3 → 5.3 Flash). Each model
+# was probed live through the real translator classes on a one-token JA→EN unit
+# before being listed (2026-09-24); deepseek-v4.1-flash answers correctly but can
+# exceed the 60 s client timeout, so it is retried once in the probe.
 TRANSLATE_MODELS: tuple[Model, ...] = (
-    Model('gemini-25-flash-lite', 'Gemini 2.5 Flash Lite', 'gemini',
-          'gemini-2.5-flash-lite',
-          'Recommended: the old workhorse, still the failover target'),
+    Model('gemini-flash-38', 'Gemini 3.8 Flash', 'gemini', 'gemini-3.8-flash',
+          'Recommended: newest flash; natural English on marketing Japanese'),
+    Model('gemini-flash', 'Gemini 3.5 Flash', 'gemini', 'gemini-3.5-flash',
+          'Balanced; also used by the translation review pass'),
     Model('gemini-flash-lite', 'Gemini 3.1 Flash Lite', 'gemini',
           'gemini-3.1-flash-lite', 'Cheap, current, slightly more literal'),
-    Model('gemini-flash', 'Gemini 3.5 Flash', 'gemini', 'gemini-3.5-flash',
-          'Balanced default; also used by the translation review pass'),
-    Model('gemini-flash-38', 'Gemini 3.8 Flash', 'gemini', 'gemini-3.8-flash',
-          'Newest flash; natural English on marketing Japanese'),
+    Model('gemini-25-flash-lite', 'Gemini 2.5 Flash Lite', 'gemini',
+          'gemini-2.5-flash-lite',
+          'Free-tier workhorse; still the failover target'),
     Model('gemini-pro', 'Gemini 3.1 Pro', 'gemini', 'gemini-3.1-pro-preview',
           'Slowest and dearest; best on dense technical prose'),
     Model('opencode-deepseek', 'DeepSeek V4.1 Flash', 'opencode',
           'deepseek-v4.1-flash', 'OpenCode, billed per token; sees slides'),
-    Model('opencode-kimi', 'Kimi K3', 'opencode', 'kimi-k3',
-          'OpenCode; dearest here at $3/$15 per M on a $15 monthly cap'),
-    Model('opencode-qwen', 'Qwen 3.8 Max', 'opencode', 'qwen3.8-max',
-          'OpenCode; $2/$6 per M on a $15 monthly cap'),
-    Model('opencode-minimax', 'MiniMax M3', 'opencode', 'minimax-m3',
-          'OpenCode; $0.30/$1.20 per M; reasoning wrapper stripped'),
+    Model('opencode-glm', 'GLM 5.3 Flash', 'opencode', 'glm-5.3-flash',
+          'OpenCode flash tier; sees slides'),
+    Model('opencode-qwen', 'Qwen 3.8 Flash', 'opencode', 'qwen3.8-flash',
+          'OpenCode flash tier; cheapest Qwen here'),
+    Model('opencode-mimo', 'MiMo V2.6 Flash', 'opencode', 'mimo-v2.6-flash',
+          'OpenCode flash tier; newest MiMo'),
     Model('opencode-longcat', 'LongCat 2.0', 'opencode', 'longcat-2.0',
           'OpenCode; $0.30/$1.20 per M'),
-    Model('opencode-glm', 'GLM 5.3', 'opencode', 'glm-5.3',
-          'OpenCode; text only, cannot look at slides'),
+    Model('opencode-minimax', 'MiniMax M3', 'opencode', 'minimax-m3',
+          'OpenCode; $0.30/$1.20 per M; reasoning wrapper stripped'),
+    Model('opencode-kimi', 'Kimi K3', 'opencode', 'kimi-k3',
+          'OpenCode; dearest here at $3/$15 per M on a $15 monthly cap'),
 )
 
 # Slide-check picker. Every entry below returned all five colour names for a test
@@ -105,9 +114,19 @@ TRANSLATE_MODELS: tuple[Model, ...] = (
 # on that one slide it reported 1 issue where the deck run reported 4 — so treat
 # the counts as a signal, not a ranking. Cheap models lead the list for cost and
 # speed; K3 stays selectable for a deck that is about to go out.
+#
+# Two lanes on purpose: the slide check accepts Gemini and OpenCode (approved
+# choice), so both lanes' verified vision models appear here. Gemini entries were
+# measured in the same colour-block probe (10/10 Gemini models saw) and are billed
+# by Google, not the Go plan — `vision_cost` reports None for them rather than a
+# Go-plan price that does not exist.
 VISION_MODELS: tuple[VisionModel, ...] = (
     VisionModel('glm-5.3-flash', 'GLM 5.3 Flash',
                 'Recommended: ~1/53 of K3 per deck, whole deck in ~38 s'),
+    VisionModel('gemini-3.8-flash', 'Gemini 3.8 Flash',
+                'Gemini lane; newest flash, Google-billed'),
+    VisionModel('gemini-3.5-flash', 'Gemini 3.5 Flash',
+                'Gemini lane; the review pass runs on this model'),
     VisionModel('qwen3.8-flash', 'Qwen 3.8 Flash',
                 'Cheapest: ~1/58 of K3; caught 8 of its 10 high-severity slides'),
     VisionModel('kimi-k3', 'Kimi K3',
@@ -124,7 +143,7 @@ VISION_MODELS: tuple[VisionModel, ...] = (
     VisionModel('omen-alpha', 'Omen Alpha', 'Sees slides'),
 )
 
-DEFAULT_TRANSLATE_KEY = 'gemini-25-flash-lite'
+DEFAULT_TRANSLATE_KEY = 'gemini-flash-38'
 # Measured on the same three slides of a real client deck (FADC), where slide 3 has
 # a genuine defect — bullet text spilling out of two boxes and colliding with the
 # grey transition arrows:

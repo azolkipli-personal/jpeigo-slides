@@ -607,12 +607,18 @@ class TranslationService:
             # kimi-k2.5 is retired upstream ("Model is unavailable"); kimi-k2.6 and
             # kimi-k3 both answer, so use the current one.
             'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k3'),
-            'opencode-qwen': OpenCodeTranslator(settings, 'qwen3.8-max'),
+            # 2026-09 list refresh: opencode-qwen and opencode-glm retargeted to the
+            # flash tier (qwen3.8-flash, glm-5.3-flash), opencode-mimo added — the
+            # newest working flash models for their families, each verified with a
+            # live one-token JA→EN probe. Keys are unchanged, so a saved selection
+            # keeps resolving.
+            'opencode-qwen': OpenCodeTranslator(settings, 'qwen3.8-flash'),
             # minimax-m2.5 could not read an image at all (HTTP 400); m3 supersedes
             # it and its reasoning wrapper is stripped before the text is used.
             'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m3'),
             'opencode-longcat': OpenCodeTranslator(settings, 'longcat-2.0'),
-            'opencode-glm': OpenCodeTranslator(settings, 'glm-5.3'),
+            'opencode-glm': OpenCodeTranslator(settings, 'glm-5.3-flash'),
+            'opencode-mimo': OpenCodeTranslator(settings, 'mimo-v2.6-flash'),
             # Fallback / direct APIs (kept for compatibility)
             'glm': GLMTranslator(settings),
             'kimi': KimiTranslator(settings),

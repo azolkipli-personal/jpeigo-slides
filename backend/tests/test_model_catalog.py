@@ -89,6 +89,21 @@ def test_defaults_are_offered():
     assert DEFAULT_TRANSLATE_KEY in {entry.key for entry in TRANSLATE_MODELS}
 
 
+def test_translate_shortlist_is_twelve():
+    """The approved list keeps 12 entries, biased to the newest flash tier."""
+    assert len(TRANSLATE_MODELS) == 12, (
+        f'expected 12 translate models, got {len(TRANSLATE_MODELS)}: '
+        f'{[entry.key for entry in TRANSLATE_MODELS]}'
+    )
+
+
+def test_default_translate_model_is_the_newest_flash():
+    """Approved default: Gemini 3.8 Flash, the newest working flash model."""
+    assert DEFAULT_TRANSLATE_KEY == 'gemini-flash-38'
+    entry = next(e for e in TRANSLATE_MODELS if e.key == DEFAULT_TRANSLATE_KEY)
+    assert entry.model == 'gemini-3.8-flash'
+
+
 def test_payload_shape_matches_what_the_page_consumes():
     payload = catalog_payload()
     assert set(payload) == {'translate', 'vision', 'defaults'}
@@ -100,24 +115,38 @@ def test_payload_shape_matches_what_the_page_consumes():
         assert entry['key'] in {'gemini-25-flash-lite', 'gemini-flash-lite', 'gemini-flash',
                                 'gemini-flash-38', 'gemini-pro', 'opencode-deepseek',
                                 'opencode-kimi', 'opencode-qwen', 'opencode-minimax',
-                                'opencode-longcat', 'opencode-glm', *vision_model_ids()}
+                                'opencode-longcat', 'opencode-glm', 'opencode-mimo',
+                                *vision_model_ids()}
 
 
-def test_vision_lane_is_opencode():
-    """Every slide-check model runs on OpenCode, whose Go plan bills per token against
-    a dollar limit per model. The lane matters because it decides what a deck costs."""
-    assert {entry.as_dict()['lane'] for entry in VISION_MODELS} == {'opencode'}
+def test_vision_lane_covers_gemini_and_opencode():
+    """The slide check accepts both lanes (approved choice): every vision model's
+    reported lane must match what qa/client.lane_for will route it to, and both
+    lanes must actually be represented — an all-opencode list would silently drop
+    the Gemini half of the decision."""
+    lanes = {entry.as_dict()['lane'] for entry in VISION_MODELS}
+    assert lanes == {'gemini', 'opencode'}, lanes
+    for entry in VISION_MODELS:
+        expected = 'gemini' if entry.model.startswith('gemini') else 'opencode'
+        assert entry.as_dict()['lane'] == expected, entry.model
 
 
 def test_cost_table_prices_what_it_offers_and_admits_what_it_cannot():
     """The Go plan prices each model against its own dollar limit, so an estimate is
     only honest if it disappears when the plan publishes no price. The three models
-    the price table omits must report None rather than a plausible-looking number.
+    the price table omits must report None rather than a plausible-looking number,
+    and so must every Gemini vision model: Google bills those, not the Go plan.
     """
     unpriced = {'deepseek-v4.1-flash', 'deepseek-flash', 'omen-alpha'}
+    opencode_vision = {e.model for e in VISION_MODELS
+                       if e.as_dict()['lane'] == 'opencode'}
+    gemini_vision = vision_model_ids() - opencode_vision
+    assert gemini_vision, 'the Gemini vision lane must not be empty'
+    for model in gemini_vision:
+        assert vision_cost(model, 1000, 1000) is None, model
     for model in unpriced:
         assert vision_cost(model, 1000, 1000) is None, model
-    for model in vision_model_ids() - unpriced:
+    for model in opencode_vision - unpriced:
         assert vision_cost(model, 1000, 1000) is not None, model
         assert vision_cost(model, 1000, 1000) > 0
 
