@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 import shutil
+import tempfile
 from contextlib import asynccontextmanager
 
 from app.config import Settings, get_settings
@@ -26,6 +27,7 @@ from app.model_catalog import DEFAULT_VISION_MODEL, catalog_payload, is_vision_m
 from app.core.extractor import extract_pptx
 from app.core.injector import inject_translations
 from app.core.fonts import check_jp_font
+from app.core.pdf_bridge import PdfBridgeError, pdf_to_pptx, pptx_to_pdf
 from app.translators.service import TranslationService
 from app.utils.cache import get_translation_memory
 from app.models import (
@@ -347,22 +349,35 @@ async def root():
     return {"status": "ok", "service": "PPTX Translator API"}
 
 
+# Uploadable deck types. Both go through the same PPTX pipeline: a PDF is
+# converted to an intermediate PPTX at upload time (see app.core.pdf_bridge).
+PPTX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+PDF_MEDIA_TYPE = "application/pdf"
+UNSUPPORTED_UPLOAD_DETAIL = "Only .pptx or .pdf files are supported"
+
+
+def _is_pdf_name(name: Optional[str]) -> bool:
+    return bool(name) and name.lower().endswith('.pdf')
+
+
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_pptx(file: UploadFile = File(...)):
     """
-    Upload a PPTX file and extract text runs.
+    Upload a PPTX (or PDF) file and extract text runs.
     
     Returns structured data about all text in the presentation.
     """
-    # Validate file type
-    if not file.filename or not file.filename.endswith('.pptx'):
-        raise HTTPException(status_code=400, detail="Only .pptx files are supported")
+    # Validate file type. Case-insensitive: a deck named DECK.PDF is a PDF.
+    if not file.filename or not file.filename.lower().endswith(('.pptx', '.pdf')):
+        raise HTTPException(status_code=400, detail=UNSUPPORTED_UPLOAD_DETAIL)
+    is_pdf = _is_pdf_name(file.filename)
     
     # Generate job ID
     job_id = str(uuid.uuid4())
     
     # Save uploaded file
     file_path = Path(settings.upload_dir) / f"{job_id}_{file.filename}"
+    intermediate_path: Optional[Path] = None  # PDF only: the converted PPTX
     
     try:
         # Save file
@@ -378,8 +393,14 @@ async def upload_pptx(file: UploadFile = File(...)):
                 detail=f"File too large. Maximum size is {settings.max_file_size / (1024*1024):.0f}MB"
             )
         
-        # Extract text runs
-        document = extract_pptx(str(file_path), generate_preview=True)
+        # Extract text runs. A PDF first becomes the intermediate PPTX that the
+        # rest of the pipeline (extraction, injection, export) already speaks;
+        # from here on the job is indistinguishable from a .pptx upload.
+        if is_pdf:
+            intermediate_path = pdf_to_pptx(file_path, Path(settings.upload_dir))
+            document = extract_pptx(str(intermediate_path), generate_preview=True)
+        else:
+            document = extract_pptx(str(file_path), generate_preview=True)
         
         # Store job info
         jobs[job_id] = TranslationJob(
@@ -390,6 +411,8 @@ async def upload_pptx(file: UploadFile = File(...)):
             translated_runs=[],
             progress=0.0,
             slides=document.slides, # Store extracted slides for rehydration
+            source_format="pdf" if is_pdf else "pptx",
+            source_filename=file.filename,
         )
         job_store.save(jobs[job_id])
         
@@ -433,10 +456,20 @@ async def upload_pptx(file: UploadFile = File(...)):
             slides=slides_data,
         )
         
+    except PdfBridgeError as e:
+        # The PDF -> PPTX conversion failed before any extraction ran: drop the
+        # raw upload (and any partial intermediate) and answer with the bridge's
+        # own status instead of a bare traceback.
+        for stale in (file_path, intermediate_path):
+            if stale is not None and stale.exists():
+                os.remove(stale)
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
         # Clean up on error
         if file_path.exists():
             os.remove(file_path)
+        if intermediate_path is not None and intermediate_path.exists():
+            os.remove(intermediate_path)
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
@@ -703,10 +736,52 @@ async def delete_job(job_id: str):
     return {"ok": True}
 
 
+def _upload_input_path(job: TranslationJob) -> Path:
+    """The deck the injector reads for this job.
+
+    A .pptx upload *is* that deck. A PDF upload is a PDF, so the injector gets
+    the intermediate PPTX written at upload time — resolved from the job's
+    recorded source name instead of a blind `*.pptx` glob, which is exactly
+    what broke for PDF jobs.
+    """
+    upload_dir = Path(settings.upload_dir)
+    if job.source_format == 'pdf':
+        # Path().name re-bases the recorded upload name, so it can never name a
+        # file outside the upload directory.
+        original = Path(job.source_filename or job.filename).name
+        intermediate = upload_dir / f"{job.job_id}_{original}.pptx"
+        if not intermediate.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Converted PPTX for this PDF not found — re-upload the file",
+            )
+        return intermediate
+    input_files = sorted(upload_dir.glob(f"{job.job_id}_*.pptx"))
+    if not input_files:
+        raise HTTPException(status_code=404, detail="Original file not found")
+    return input_files[0]
+
+
+def _export_output_name(job: TranslationJob, requested: Optional[str]) -> str:
+    """Filename the export is written under — never a path component a client chose.
+
+    Reduced to its basename (no directory, no `..`), falling back to a name built
+    from the job's own record; for a PDF job the name is forced to end in `.pdf`,
+    so a PDF download can only ever download as a PDF.
+    """
+    default = f"translated_{job.source_filename or job.filename}"
+    name = Path(str(requested).replace('\\', '/')).name if requested else ''
+    if not name or name in ('.', '..'):
+        name = default
+    if job.source_format == 'pdf' and not name.lower().endswith('.pdf'):
+        name = f"{Path(name).stem or 'translated'}.pdf"
+    return name
+
+
 @app.post("/api/export")
 async def export_pptx(request: ExportRequest):
     """
-    Export translated PPTX file.
+    Export translated PPTX (or PDF for a PDF job) file.
     
     Takes the job ID and returns the translated file.
     """
@@ -719,38 +794,51 @@ async def export_pptx(request: ExportRequest):
     if job.status != "completed":
         raise HTTPException(status_code=400, detail="Job not completed")
     
-    # Find uploaded file
-    upload_dir = Path(settings.upload_dir)
-    input_files = list(upload_dir.glob(f"{job_id}_*.pptx"))
-    
-    if not input_files:
-        raise HTTPException(status_code=404, detail="Original file not found")
-    
-    input_path = input_files[0]
-    output_filename = request.filename or f"translated_{job.filename}"
+    # Find uploaded file by source format, not by a `.pptx` glob.
+    input_path = _upload_input_path(job)
+    is_pdf = job.source_format == 'pdf'
+    output_filename = _export_output_name(job, request.filename)
     output_path = Path(settings.output_dir) / output_filename
     
     try:
-        # Inject translations
-        success, failed = inject_translations(
-            str(input_path),
-            str(output_path),
-            job.translated_runs,
-            None,  # Original document not needed for injection
-        )
-        
-        if not success:
-            # Injection failures used to be printed and the file served anyway, so a
-            # partially-translated deck looked like a clean export. Surface the count
-            # to the UI via headers, since the response body is the PPTX itself.
-            for run in failed:
-                print(f"Failed to inject: {run.run_id}")
+        if is_pdf:
+            # Inject into a scratch copy of the intermediate and convert *that*
+            # to the PDF deliverable, so the intermediate stays pristine and a
+            # re-export always starts from the original extraction.
+            with tempfile.TemporaryDirectory(prefix='pdf-export-') as tmp:
+                injected = Path(tmp) / 'translated.pptx'
+                success, failed = inject_translations(
+                    str(input_path),
+                    str(injected),
+                    job.translated_runs,
+                    None,  # Original document not needed for injection
+                )
+                if not success:
+                    for run in failed:
+                        print(f"Failed to inject: {run.run_id}")
+                produced = pptx_to_pdf(injected, Path(tmp))
+                shutil.move(str(produced), str(output_path))
+        else:
+            # Inject translations
+            success, failed = inject_translations(
+                str(input_path),
+                str(output_path),
+                job.translated_runs,
+                None,  # Original document not needed for injection
+            )
+            
+            if not success:
+                # Injection failures used to be printed and the file served anyway, so a
+                # partially-translated deck looked like a clean export. Surface the count
+                # to the UI via headers, since the response body is the PPTX itself.
+                for run in failed:
+                    print(f"Failed to inject: {run.run_id}")
         
         # Return file
         return FileResponse(
             path=str(output_path),
             filename=output_filename,
-            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            media_type=PDF_MEDIA_TYPE if is_pdf else PPTX_MEDIA_TYPE,
             headers={
                 "X-Injection-Failed": str(len(failed)),
                 "X-Injection-Total": str(len(job.translated_runs)),
@@ -758,6 +846,11 @@ async def export_pptx(request: ExportRequest):
             },
         )
         
+    except HTTPException:
+        raise
+    except PdfBridgeError as e:
+        # Conversion failure with a message meant to be read, not a traceback.
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error exporting file: {str(e)}")
 
@@ -822,7 +915,17 @@ def _deck_path_for(job_id: str, which: str = 'translated') -> Path:
     stem = Path(job.filename).stem
 
     if which == 'original':
-        candidates = sorted(upload_dir.glob(f"{job_id}_*")) or sorted(upload_dir.glob(f"*{stem}*"))
+        if job.source_format == 'pdf':
+            # The upload itself is the PDF (served as-is: LibreOffice imports PDF
+            # content whatever extension it is handed, so preview and vision QA
+            # both render it). Suffix filter, not sort order, decides — the
+            # intermediate PPTX sits next to it in the same directory.
+            candidates = [
+                path for path in sorted(upload_dir.glob(f"{job_id}_*"))
+                if path.suffix.lower() == '.pdf'
+            ]
+        else:
+            candidates = sorted(upload_dir.glob(f"{job_id}_*")) or sorted(upload_dir.glob(f"*{stem}*"))
     else:
         candidates = [output_dir / f"translated_{job.filename}", output_dir / job.filename]
         candidates = [path for path in candidates if path.exists()] or sorted(output_dir.glob(f"*{stem}*"))
@@ -960,7 +1063,9 @@ async def get_source_deck(job_id: str, _auth: str = Depends(verify_api_key)):
     return FileResponse(
         path=str(path),
         filename=Path(path).name,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        # A PDF job's original deck is a PDF; labelling it as a PPTX would make
+        # every client that trusts Content-Type hand it to a PPTX parser.
+        media_type=PDF_MEDIA_TYPE if Path(path).suffix.lower() == '.pdf' else PPTX_MEDIA_TYPE,
     )
 
 

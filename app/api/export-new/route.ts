@@ -53,21 +53,31 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Get the binary PPTX file
+    // Get the binary deck (PPTX, or PDF for a PDF job)
     const arrayBuffer = await response.arrayBuffer();
 
-    // Content-Disposition header must be ASCII. For non-ASCII (e.g. Japanese)
-    // filenames, use RFC 5987 filename*=UTF-8''encoding with an ASCII fallback,
-    // otherwise Next.js throws "Cannot convert argument to a ByteString" -> 500.
-    const asciiFallback = 'translated.pptx';
+    // The backend names and labels the file per format — a PDF job must not be
+    // served as a PPTX — so forward its Content-Type/Content-Disposition. The
+    // legacy hard-coded pair below stays as the fallback: Content-Disposition
+    // must be ASCII, and the backend percent-encodes non-ASCII names (RFC 5987
+    // filename*) already, which is what makes its header safe to forward.
+    const asciiFallback = (filename || '').toLowerCase().endsWith('.pdf')
+      ? 'translated.pdf'
+      : 'translated.pptx';
     const encodedFilename = encodeURIComponent(filename || asciiFallback);
-    const contentDisposition = `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`;
+    const fallbackDisposition = `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`;
+    const backendDisposition = response.headers.get('Content-Disposition');
+    const backendType = response.headers.get('Content-Type');
 
     return new NextResponse(arrayBuffer, {
       status: 200,
       headers: {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'Content-Disposition': contentDisposition,
+        'Content-Type': backendType || (
+          (filename || '').toLowerCase().endsWith('.pdf')
+            ? 'application/pdf'
+            : 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        ),
+        'Content-Disposition': backendDisposition || fallbackDisposition,
         // Injection failures are reported by the backend as headers (the body is
         // the PPTX). Re-emit them or the UI can never see a partial export.
         ...(response.headers.get('X-Injection-Failed')

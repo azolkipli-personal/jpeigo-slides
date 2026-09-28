@@ -43,9 +43,9 @@ type UI = 'en' | 'ja';
 const en = {
   title: 'PPTX Translator',
   subtitle: 'Translate PowerPoint slides',
-  desc: 'Upload a .pptx file to extract and translate text while preserving formatting.',
+  desc: 'Upload a .pptx or .pdf file to extract and translate text while preserving formatting.',
   uploadPrompt: 'Drag a file here or click to browse',
-  uploadHint: '.pptx files up to 100MB',
+  uploadHint: '.pptx and .pdf files up to 100MB',
   extracting: 'Extracting text from PowerPoint...',
   from: 'From', to: 'To',
   model: 'Translation model',
@@ -54,7 +54,7 @@ const en = {
   glossary: 'Glossary terms (optional)',
   glossaryPlaceholder: 'List terms to keep untranslated, one per line.\ne.g., Project X, Brand Z, Azure',
   translate: 'Translate', translating: 'Translating...',
-  download: 'Download PPTX', downloading: 'Exporting...',
+  download: 'Download PPTX', downloadPdf: 'Download PDF', downloading: 'Exporting...',
   slides: 'slides', runs: 'text runs',
   startOver: 'Start over',
   review: 'Translations',
@@ -62,7 +62,7 @@ const en = {
   original: 'Original', translation: 'Translation',
   preview: 'Preview',
   noApiKeys: 'No API keys configured', modelsReady: 'ready',
-  onlyPptx: 'Only .pptx files are supported',
+  onlyPptx: 'Only .pptx and .pdf files are supported',
   uploadFailed: 'Upload failed', noText: 'No text runs found to translate',
   translationFailed: 'Translation failed', exportFailed: 'Export failed',
   slideLabel: 'Slide',
@@ -95,9 +95,9 @@ const en = {
 const ja: typeof en = {
   title: 'PPTX翻訳',
   subtitle: 'PowerPointスライドを翻訳',
-  desc: 'pptxファイルをアップロードして、テキストを抽出・翻訳。フォーマットはそのまま保持します。',
+  desc: 'pptxまたはpdfファイルをアップロードして、テキストを抽出・翻訳。フォーマットはそのまま保持します。',
   uploadPrompt: 'ファイルをドラッグ＆ドロップ、またはクリックして選択',
-  uploadHint: '.pptx ファイル（100MBまで）',
+  uploadHint: '.pptx / .pdf ファイル（100MBまで）',
   extracting: 'PowerPointからテキストを抽出中...',
   from: '翻訳元', to: '翻訳先',
   model: '翻訳モデル',
@@ -106,7 +106,7 @@ const ja: typeof en = {
   glossary: '訳さない用語（任意）',
   glossaryPlaceholder: '原文のまま残す用語を1行ずつ入力\n例：Project X、Azure',
   translate: '翻訳する', translating: '翻訳中...',
-  download: 'PPTXをダウンロード', downloading: 'エクスポート中...',
+  download: 'PPTXをダウンロード', downloadPdf: 'PDFをダウンロード', downloading: 'エクスポート中...',
   slides: 'スライド', runs: 'テキスト',
   startOver: '最初から',
   review: '翻訳結果',
@@ -114,7 +114,7 @@ const ja: typeof en = {
   original: '原文', translation: '翻訳文',
   preview: 'プレビュー',
   noApiKeys: 'APIキーが設定されていません', modelsReady: '利用可能',
-  onlyPptx: '.pptxファイルのみ対応しています',
+  onlyPptx: '.pptxまたは.pdfファイルのみ対応しています',
   uploadFailed: 'アップロード失敗', noText: '翻訳するテキストが見つかりません',
   translationFailed: '翻訳失敗', exportFailed: 'エクスポート失敗',
   slideLabel: 'スライド',
@@ -145,6 +145,18 @@ const ja: typeof en = {
   downloadAll: 'すべてダウンロード',
 };
 const t = (ui: UI) => ui === 'en' ? en : ja;
+
+// --- file types ---
+const isSupportedName = (name: string) => /\.(pptx|pdf)$/i.test(name);
+const isPdfName = (name: string) => /\.pdf$/i.test(name);
+/** A PDF job downloads as <original>.pdf — extension normalised, never a path. */
+const pdfDownloadName = (name: string): string => {
+  const base = name.split(/[\\/]/).pop() || 'translated.pdf';
+  return /\.pdf$/i.test(base) ? `${base.slice(0, -4)}.pdf` : `${base}.pdf`;
+};
+/** Export + download name: unchanged for PPTX, `<original>.pdf` for a PDF job. */
+const exportDownloadName = (original: string): string =>
+  (isPdfName(original) ? pdfDownloadName(original) : `translated_${original}`);
 
 /** Poll a job until it leaves "processing". Returns the final status, or null on timeout. */
 async function waitForJob(jobId: string, timeoutMs = 60 * 60 * 1000): Promise<string | null> {
@@ -244,7 +256,7 @@ export default function NewTranslatorPage() {
         const exRes = await fetch('/api/export-new', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ job_id: doc.job_id, filename: `translated_${doc.filename}` }),
+          body: JSON.stringify({ job_id: doc.job_id, filename: exportDownloadName(doc.filename) }),
         });
         if (!exRes.ok) throw new Error(text.exportFailed);
         const blob = await exRes.blob();
@@ -260,7 +272,7 @@ export default function NewTranslatorPage() {
   const addBatchFiles = useCallback((files: FileList | null) => {
     if (!files) return;
     const valid: BatchItem[] = Array.from(files)
-      .filter(f => f.name.endsWith('.pptx'))
+      .filter(f => isSupportedName(f.name))
       .map(f => ({ file: f, name: f.name, size: f.size, status: 'waiting' as const }));
     if (valid.length > 0) setBatchItems(prev => [...prev, ...valid]);
   }, []);
@@ -414,7 +426,7 @@ export default function NewTranslatorPage() {
   }, [visionModel, ui]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleFile = useCallback(async (file: File) => {
-    if (!file.name.endsWith('.pptx')) { setError(text.onlyPptx); return; }
+    if (!isSupportedName(file.name)) { setError(text.onlyPptx); return; }
     setLoading(true); setError(null); setProgress(0); setTranslatedRuns([]);
     setPreviewImages([]); setPreviewError(null);
     try {
@@ -527,15 +539,17 @@ export default function NewTranslatorPage() {
   const handleExport = useCallback(async () => {
     if (!document || translatedRuns.length === 0) return;
     setExporting(true); setError(null);
+    // A PDF job downloads as <original>.pdf; a PPTX job keeps translated_<name>.
+    const downloadName = exportDownloadName(document.filename);
     try {
-      const response = await fetch('/api/export-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: document.job_id, filename: `translated_${document.filename}` }) });
+      const response = await fetch('/api/export-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: document.job_id, filename: downloadName }) });
       if (!response.ok) { const err = await response.json().catch(() => ({ error: text.exportFailed })); throw new Error(err.error || text.exportFailed); }
-      // The export body is the PPTX, so injection failures arrive as headers.
+      // The export body is the deck, so injection failures arrive as headers.
       const injectionFailures = Number(response.headers.get('X-Injection-Failed') || 0);
       const injectionTotal = Number(response.headers.get('X-Injection-Total') || 0);
       setApiError(injectionFailures > 0 ? `${injectionFailures} of ${injectionTotal} text runs could not be placed in the exported deck.` : null);
       const blob = await response.blob(); const url = window.URL.createObjectURL(blob);
-      const a = window.document.createElement('a'); a.href = url; a.download = `translated_${document.filename}`;
+      const a = window.document.createElement('a'); a.href = url; a.download = downloadName;
       window.document.body.appendChild(a); a.click(); window.document.body.removeChild(a); window.URL.revokeObjectURL(url);
     } catch (err) { setError(err instanceof Error ? err.message : text.exportFailed); }
     finally { setExporting(false); }
@@ -652,7 +666,7 @@ export default function NewTranslatorPage() {
                 }`}
               >
                 {/* multiple: enables multi-select; single files take the normal path via onChange */}
-                <input ref={fileInputRef} type="file" accept=".pptx" multiple className="hidden" onChange={e => {
+                <input ref={fileInputRef} type="file" accept=".pptx,.pdf" multiple className="hidden" onChange={e => {
                   const files = e.target.files;
                   if (files && files.length === 1) handleFile(files[0]);
                   else if (files) addBatchFiles(files);
@@ -709,9 +723,9 @@ export default function NewTranslatorPage() {
                       <li key={`${item.name}-${i}`} className="flex items-center justify-between gap-3 text-sm">
                         <span className="truncate flex-1 text-gray-700 dark:text-zinc-200">{item.name}</span>
                         {item.status === 'done' && item.blobUrl && (
-                          <a href={item.blobUrl} download={`translated_${item.name}`}
+                          <a href={item.blobUrl} download={exportDownloadName(item.name)}
                             className="px-3 py-1 rounded-md text-xs font-medium bg-green-600 hover:bg-green-700 text-white transition-colors shadow-sm">
-                            ⬇ {text.download}
+                            ⬇ {isPdfName(item.name) ? text.downloadPdf : text.download}
                           </a>
                         )}
                         {item.status === 'failed' && (
@@ -845,7 +859,7 @@ export default function NewTranslatorPage() {
                   {allDone && (
                     <button onClick={handleExport} disabled={exporting}
                       className="px-6 py-2.5 rounded-lg text-sm font-medium text-white bg-green-600 hover:bg-green-700 disabled:bg-gray-300 dark:disabled:bg-zinc-700 transition-colors shadow-sm">
-                      {exporting ? text.downloading : text.download}
+                      {exporting ? text.downloading : (isPdfName(document.filename) ? text.downloadPdf : text.download)}
                     </button>
                   )}
                   <button onClick={resetAll}

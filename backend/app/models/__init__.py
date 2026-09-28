@@ -130,6 +130,13 @@ class TranslationJob(BaseModel):
     progress: float = 0.0
     error: Optional[str] = None
     slides: list[Slide] = [] # Added for frontend rehydration
+    # What kind of file was uploaded and the name it arrived with. For a PDF the
+    # stored file is the LibreOffice intermediate PPTX (the pipeline only speaks
+    # PPTX), so the original upload name and format have to be remembered to
+    # resolve the right deck and to name the exported PDF. Defaults keep old
+    # persisted rows valid — the store round-trips model_dump_json as-is.
+    source_format: str = "pptx"  # "pptx" | "pdf"
+    source_filename: Optional[str] = None
     # Layer 2 / Layer 3 reports, keyed by pass name. Written only by the opt-in QA
     # endpoints, kept on the job so a report outlives the request that produced it.
     qa_reports: dict = {}
