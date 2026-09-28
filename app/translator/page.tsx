@@ -18,7 +18,9 @@ interface ModelCatalog { translate: CatalogModel[]; vision: CatalogModel[]; defa
 interface QaIssue { slide: number; type: string; severity: string; where?: string | null; detail?: string | null; }
 interface QaReport {
   model?: string; slides_rendered?: number; slides_checked?: number; summary?: string;
-  issues: QaIssue[]; errors?: { slide: number; error: string }[];
+  // A run in flight can report without findings yet, and the backend's report is
+  // built up as slides land — so neither list is guaranteed to be present.
+  issues?: QaIssue[]; errors?: { slide: number; error: string }[];
   /** The deck's length, so the panel knows how many chunks a full check needs. */
   deck_slides?: number | null;
   first_slide?: number | null; last_slide?: number | null;
@@ -405,7 +407,11 @@ export default function NewTranslatorPage() {
 
         // Publish whatever the backend already reviewed: findings show up slide by
         // slide, and a poll that fails never discards the slides done so far.
-        if (state?.report) setQaReport(state.report);
+        // The first poll of a run can return an empty report object while the deck is
+        // still rendering; `{}` is truthy, so accepting it as-is left the panel
+        // rendering `qaReport.issues.length` on undefined and React tore down the
+        // whole page. Only adopt a report that actually has findings to render.
+        if (state?.report && Array.isArray(state.report.issues)) setQaReport(state.report);
         checked = state?.report?.slides_checked ?? state?.checked ?? checked;
         rendered = state?.report?.slides_rendered ?? rendered;
         setQaProgress({ checked, total: state?.total ?? null });
@@ -543,7 +549,16 @@ export default function NewTranslatorPage() {
     const downloadName = exportDownloadName(document.filename);
     try {
       const response = await fetch('/api/export-new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: document.job_id, filename: downloadName }) });
-      if (!response.ok) { const err = await response.json().catch(() => ({ error: text.exportFailed })); throw new Error(err.error || text.exportFailed); }
+      if (!response.ok) {
+        // On a failure the body is JSON, but a proxy that died mid-stream answers
+        // with an HTML error page or nothing at all — parsing blindly threw and
+        // replaced the real cause with a bare "Export failed".
+        const raw = await response.text();
+        let message = raw;
+        try { message = (JSON.parse(raw) as { error?: string })?.error || raw; } catch { /* not JSON */ }
+        if (!message.trim()) message = `HTTP ${response.status}`;
+        throw new Error(message);
+      }
       // The export body is the deck, so injection failures arrive as headers.
       const injectionFailures = Number(response.headers.get('X-Injection-Failed') || 0);
       const injectionTotal = Number(response.headers.get('X-Injection-Total') || 0);
@@ -1044,11 +1059,11 @@ export default function NewTranslatorPage() {
 
                           {/* Not while a later chunk may still turn something up: a
                               green "nothing found" after chunk 1 of 20 is a lie. */}
-                          {!qaRunning && qaReport.issues.length === 0 && !(qaReport.errors || []).length && (
+                          {!qaRunning && (qaReport.issues || []).length === 0 && !(qaReport.errors || []).length && (
                             <p className="mt-2 text-sm text-green-700 dark:text-green-300">{text.slideCheckClean}</p>
                           )}
 
-                          {qaReport.issues.map((issue, i) => (
+                          {(qaReport.issues || []).map((issue, i) => (
                             <div key={i} className={`mt-2 px-4 py-3 rounded-lg border text-sm ${
                               issue.severity === 'high'
                                 ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-900'
