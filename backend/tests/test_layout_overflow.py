@@ -28,12 +28,14 @@ from pptx.util import Pt
 from app.core.injector import (
     SLIDE_EDGE_MARGIN_EMU,
     calculate_font_scale,
+    estimate_text_width,
     frame_text_exceeds_box,
     frame_text_grew,
     paragraph_font_scale,
     replace_text_in_shape,
     resolve_font_size,
     CellBox,
+    MIN_LEGIBLE_FONT_PT,
 )
 from app.models import TranslatedRun
 
@@ -202,13 +204,38 @@ check('the off-slide frame is clamped so its right edge lands on the limit',
       f'limit={(prs.slide_width - SLIDE_EDGE_MARGIN_EMU) / 12700:.1f}pt')
 check('only width came off — the left edge did not move', box.left == Pt(600),
       f'left={box.left / 12700:.1f}pt')
+def _residual_ratio(text_frame, shape) -> float:
+    """How far past its box the widest paragraph sits (1.0 = fits exactly)."""
+    sizes = [r.font.size.pt for p in text_frame.paragraphs for r in p.runs if r.font.size]
+    size = max(sizes) if sizes else 18.0
+    usable = (int(shape.width) / 12700
+              - sum(int(getattr(text_frame, a, 0) or 0)
+                    for a in ('margin_left', 'margin_right')) / 12700)
+    worst = 0.0
+    if usable <= 0:
+        return worst
+    for para in text_frame.paragraphs:
+        text = ''.join(r.text for r in para.runs)
+        if text.strip():
+            worst = max(worst, estimate_text_width(text, size) / usable)
+    return worst
+
+
 clamped_run = frame.paragraphs[0].runs[0]
 check('clamping was not enough, so the frame text was shrunk instead of '
       'running off',
       clamped_run.font.size is not None and Pt(9) <= clamped_run.font.size < Pt(18),
       f'size={clamped_run.font.size.pt if clamped_run.font.size else None}pt')
-check('after the shrink the text fits the clamped box',
-      not frame_text_exceeds_box(frame, box))
+# The legibility floor is the stricter of the two: 18pt x 98/180 would be 9.8pt,
+# but 10pt is the smallest size this pipeline will write, so the shrink stops
+# there and the last two points are left to wrap and spill — a legible frame
+# that is 2% over its box beats a frame nothing can read.
+check('the shrink stops at the legibility floor, not below it',
+      clamped_run.font.size == Pt(MIN_LEGIBLE_FONT_PT),
+      f'size={clamped_run.font.size.pt:.2f}pt floor={MIN_LEGIBLE_FONT_PT}pt')
+check('the residual overflow at the floor is small, not a slide-wide bleed',
+      not frame_text_exceeds_box(frame, box) or _residual_ratio(frame, box) < 1.05,
+      f'ratio={_residual_ratio(frame, box):.3f}')
 
 # A frame already inside the slide must not move by a single EMU — including
 # one whose right edge sits inside the margin band but still on the slide.

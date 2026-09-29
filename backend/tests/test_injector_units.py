@@ -20,6 +20,7 @@ from app.core.extractor import extract_runs_from_text_frame
 from app.core.injector import (
     A_NS,
     JP_FONT_FAMILY,
+    MIN_LEGIBLE_FONT_PT,
     _paragraph_key,
     calculate_font_scale,
     clear_run_text,
@@ -118,13 +119,25 @@ check('post-fix: non-Japanese targets are left alone',
 print('\n[3] adjusted_font_size is no longer discarded (§2.3)')
 fit_run = run_of('run_4_1_0_0_5', 'あ' * 30, 'a' * 60, adjusted=9.0)
 size = resolve_font_size(fit_run, 0.5, Pt(20))
-check('post-fix: the geometry fit result wins over the paragraph scale', size == 9.0,
-      f'adjusted=9.0, scale would give {20 * 0.5:.1f} -> resolved {size}')
+check('post-fix: the geometry fit result wins over the paragraph scale',
+      size == MIN_LEGIBLE_FONT_PT,
+      f'adjusted=9.0 (below the {MIN_LEGIBLE_FONT_PT}pt floor), scale would give '
+      f'{20 * 0.5:.1f} -> resolved {size}')
 size_no_scale = resolve_font_size(fit_run, 1.0, Pt(20))
-check('post-fix: adjusted size survives an unscaled paragraph',
-      size_no_scale == 9.0, f'scale=1.0 -> resolved {size_no_scale}')
+check('post-fix: adjusted size survives an unscaled paragraph, still floored',
+      size_no_scale == MIN_LEGIBLE_FONT_PT, f'scale=1.0 -> resolved {size_no_scale}')
 check('pre-fix equivalent: scale alone would have written 10.0pt', (20 * 0.5) != 9.0,
       'old code set Pt(orig*scale) and dropped the field')
+
+legible = run_of('run_4_2_0_0_7', 'あ' * 30, 'a' * 60, adjusted=14.0)
+check('post-fix: a fit result above the floor is passed through untouched',
+      resolve_font_size(legible, 1.0, Pt(20)) == 14.0,
+      f'resolved {resolve_font_size(legible, 1.0, Pt(20))}')
+footer = run_of('run_4_3_0_0_8', 'x', 'x', adjusted=8.1)
+check('post-fix: text already below the floor is never enlarged by it',
+      resolve_font_size(footer, 1.0, Pt(8.1)) == 8.1,
+      f'8.1pt footer resolved {resolve_font_size(footer, 1.0, Pt(8.1))}')
+
 
 untouched = run_of('run_4_1_0_1_6', 'text', 'テキスト')
 check('post-fix: nothing to do means no size stamp (runs keep inherited size)',

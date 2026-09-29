@@ -76,6 +76,28 @@ MIN_CLAMPED_WIDTH_EMU = 91440  # 0.1in
 # wrap on for the frame by then.
 FIT_SHRINK_FLOOR = 0.5
 
+# Type never shrinks below this, whatever the box demands: 6pt body text is
+# unreadable in a meeting room, and a deck full of it is worse than a frame that
+# spills a few points. Measured on the deck that motivated this: 6.0pt is exactly
+# 12pt x the 0.5 floor, and 5.25pt is 10.5pt x 0.5, so the floor was being reached
+# on ~29 frames and passed on others. A limit on shrinking only — a frame the
+# source already set at or below this (the 8.1pt Hitachi footer) never changes.
+MIN_LEGIBLE_FONT_PT = float(os.environ.get('PPTX_MIN_FONT_PT', '10'))
+
+
+def legibility_floor_scale(size_pt: Optional[float]) -> float:
+    """Smallest scale allowed for text that starts at `size_pt`.
+
+    1.0 for text already at or below the floor, i.e. it may not shrink at all;
+    MIN_LEGIBLE_FONT_PT/size_pt above it. The floor is a point size, not a
+    fraction of an original nobody can see, so it means the same thing on a 12pt
+    bullet and a 32pt title.
+    """
+    if not size_pt or size_pt <= MIN_LEGIBLE_FONT_PT:
+        return 1.0
+    return MIN_LEGIBLE_FONT_PT / size_pt
+
+
 
 def estimate_visual_width(text: str) -> float:
     """Estimate visual width of text. CJK chars are ~2.2x width of Latin chars in practice."""
@@ -141,13 +163,21 @@ def resolve_font_size(tr: TranslatedRun, para_scale: float, orig_font_size) -> O
 
     Taking the minimum stops the paragraph scale from overwriting
     adjusted_font_size (the geometry-fit result), which used to be discarded.
+    The result is then raised to the legibility floor (gap: 8.1pt footers and
+    6pt bullets both shipped) — a frame that cannot hold its text at a legible
+    size is allowed to spill instead, which is what the reader can still read.
     """
     candidates = []
     if tr.adjusted_font_size:
         candidates.append(tr.adjusted_font_size)
     if para_scale < 1.0 and orig_font_size:
         candidates.append(orig_font_size.pt * para_scale)
-    return min(candidates) if candidates else None
+    if not candidates:
+        return None
+    size = min(candidates)
+    if orig_font_size:
+        size = max(size, min(orig_font_size.pt, MIN_LEGIBLE_FONT_PT))
+    return size
 
 
 def estimate_text_width(text: str, font_size: float) -> float:
@@ -337,18 +367,23 @@ def shrink_frame_text_to_fit(text_frame, box_width_emu) -> Optional[float]:
 
     fallback = _fallback_font_pt(text_frame)
     scale = 1.0
+    frame_sizes = []
     for para in text_frame.paragraphs:
         text = ''.join(run.text for run in para.runs)
         if not text.strip():
             continue
         sizes = [run.font.size.pt for run in para.runs if run.font.size]
         size = max(sizes) if sizes else fallback
+        frame_sizes.append(size)
         width = estimate_text_width(text, size)
         if width > box_pt:
             scale = min(scale, box_pt / width)
     if scale >= 1.0:
         return None
-    scale = max(scale, FIT_SHRINK_FLOOR)
+    # Two floors, the stricter wins: the old hard 0.5, and the legibility floor
+    # expressed against this frame's own largest size.
+    reference_pt = max(frame_sizes) if frame_sizes else fallback
+    scale = max(scale, FIT_SHRINK_FLOOR, legibility_floor_scale(reference_pt))
 
     shrunk = False
     for para in text_frame.paragraphs:
@@ -356,7 +391,31 @@ def shrink_frame_text_to_fit(text_frame, box_width_emu) -> Optional[float]:
             if run.font.size:
                 run.font.size = Pt(run.font.size.pt * scale)
                 shrunk = True
+    if shrunk:
+        # Tell the renderer the size we decided; without it PowerPoint recomputes
+        # its own shrink-to-fit on open and can drop straight back below the floor.
+        pin_font_scale(text_frame, scale)
     return scale if shrunk else None
+
+
+def pin_font_scale(text_frame, scale: float) -> bool:
+    """Write an explicit fontScale into a frame's existing normAutofit.
+
+    Only frames already on normAutofit are touched — this never introduces
+    autofit, it only stops a renderer from re-deciding a size we already
+    corrected. Returns True when a value was written.
+    """
+    try:
+        body_pr = text_frame._txBody.find(f'{{{A_NS}}}bodyPr')
+        if body_pr is None:
+            return False
+        norm = body_pr.find(f'{{{A_NS}}}normAutofit')
+        if norm is None:
+            return False
+        norm.set('fontScale', str(int(round(scale * 100000))))
+        return True
+    except Exception:
+        return False
 
 
 class CellBox:
