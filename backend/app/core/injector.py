@@ -58,6 +58,24 @@ CHAR_WIDTH_RATIOS = {
 # to the same value.
 DEFAULT_FONT_PT = 12.0
 
+# A frame whose box sits past the slide edge is clipped at the boundary whatever
+# its wrap/autofit does, so the box itself has to come back first (gap 1). The
+# margin is 0.1in — PowerPoint's own default text inset — because LibreOffice's
+# PDF import writes lIns=rIns=0 on every frame it creates: with no inset left
+# inside the frame, this margin is the only gap between its text and the
+# physical edge of the slide.
+SLIDE_EDGE_MARGIN_EMU = 91440  # 0.1in
+
+# No clamped frame is left narrower than this; a box that would shrink past it
+# slides back whole instead (see clamp_frame_to_slide).
+MIN_CLAMPED_WIDTH_EMU = 91440  # 0.1in
+
+# shrink_frame_text_to_fit() stops here — the same floor calculate_font_scale
+# applies to paragraph scaling. Text that still does not fit wraps instead of
+# shrinking into illegibility, and apply_frame_layout() has already turned
+# wrap on for the frame by then.
+FIT_SHRINK_FLOOR = 0.5
+
 
 def estimate_visual_width(text: str) -> float:
     """Estimate visual width of text. CJK chars are ~2.2x width of Latin chars in practice."""
@@ -161,6 +179,24 @@ def frame_text_grew(runs: list[TranslatedRun]) -> bool:
     return estimate_visual_width(translated) > estimate_visual_width(original)
 
 
+def _usable_box_pt(text_frame, width_emu: int) -> float:
+    """Box width in points, minus the frame's own left and right insets."""
+    margins = 0
+    for attr in ('margin_left', 'margin_right'):
+        try:
+            margins += int(getattr(text_frame, attr) or 0)
+        except Exception:
+            pass
+    return (width_emu - margins) / 12700
+
+
+def _fallback_font_pt(text_frame) -> float:
+    """Largest explicit run size in the frame; DEFAULT_FONT_PT when there is none."""
+    sizes = [run.font.size.pt for para in text_frame.paragraphs
+             for run in para.runs if run.font.size]
+    return max(sizes) if sizes else DEFAULT_FONT_PT
+
+
 def frame_text_exceeds_box(text_frame, shape) -> bool:
     """True when any paragraph of the frame needs more than one line to fit.
 
@@ -172,19 +208,11 @@ def frame_text_exceeds_box(text_frame, shape) -> bool:
         width_emu = int(shape.width)
     except (TypeError, ValueError):
         return False
-    margins = 0
-    for attr in ('margin_left', 'margin_right'):
-        try:
-            margins += int(getattr(text_frame, attr) or 0)
-        except Exception:
-            pass
-    box_pt = (width_emu - margins) / 12700
+    box_pt = _usable_box_pt(text_frame, width_emu)
     if box_pt <= 0:
         return False
 
-    frame_sizes = [run.font.size.pt for para in text_frame.paragraphs
-                   for run in para.runs if run.font.size]
-    fallback = max(frame_sizes) if frame_sizes else DEFAULT_FONT_PT
+    fallback = _fallback_font_pt(text_frame)
 
     for para in text_frame.paragraphs:
         text = ''.join(run.text for run in para.runs)
@@ -227,6 +255,127 @@ def apply_frame_layout(shape, text_frame, runs: list[TranslatedRun]) -> tuple[bo
     except Exception as exc:
         print(f"  [INJECTOR] frame layout fix failed (shape {getattr(shape, 'shape_id', '?')}): {exc}")
     return autofit_changed, wrap_changed
+
+
+def slide_width_emu(shape) -> Optional[int]:
+    """Width of the slide `shape` sits on, or None when it cannot be resolved."""
+    try:
+        return int(shape.part.package.presentation_part.presentation.slide_width)
+    except Exception:
+        return None
+
+
+def clamp_frame_to_slide(shape) -> bool:
+    """Pull a frame that sits past the slide's right edge back inside the slide.
+
+    LibreOffice's PDF import recreates some text boxes off-slide (up to 213pt
+    past the edge on the deck this was written for), and a frame out there is
+    clipped at the slide boundary whatever its wrap or autofit does — no
+    wrap/autofit change can rescue a box that is not on the page. Only the box
+    is touched, and only when it is actually off-slide:
+
+      * a frame already inside the slide does not move by a single EMU;
+      * otherwise `width` comes off first, so the frame keeps its left edge and
+        the narrowed box is a subset of the old one — it cannot come to rest on
+        anything the source did not already cover;
+      * `left` moves only when the left edge itself is past the limit, i.e. when
+        shrinking would leave a sliver (no such frame in the deck under test).
+
+    Grouped children are never passed here: their coordinates live in the
+    group's child space, so a clamp in EMUs would not land them on the slide.
+
+    Returns True when the frame moved.
+    """
+    slide_width = slide_width_emu(shape)
+    if slide_width is None:
+        return False
+    limit = slide_width - SLIDE_EDGE_MARGIN_EMU
+    if limit <= 0:
+        return False
+    try:
+        left = int(shape.left)
+        width = int(shape.width)
+    except (TypeError, ValueError):
+        return False
+
+    if left + width <= slide_width:
+        return False  # inside the slide — not one EMU moves
+
+    if left < limit and limit - left >= MIN_CLAMPED_WIDTH_EMU:
+        shape.width = limit - left
+        return True
+
+    # The left edge is (nearly) past the limit too: taking width off would leave
+    # a sliver, so the frame slides back whole, capped at the usable slide width.
+    new_width = min(width, limit)
+    if new_width != width:
+        shape.width = new_width
+    shape.left = limit - new_width
+    return True
+
+
+def shrink_frame_text_to_fit(text_frame, box_width_emu) -> Optional[float]:
+    """Shrink a frame's text until its widest paragraph fits the box.
+
+    Only for frames clamp_frame_to_slide() had to pull back: clamping can leave
+    a box narrower than the text the paragraph scale fitted to the old box (the
+    213pt case), and a frame that cannot hold its text on the slide gives up
+    font size rather than run off the edge. One scale for the whole frame — the
+    rule paragraph_font_scale applies per paragraph — floored at
+    FIT_SHRINK_FLOOR; whatever still does not fit wraps, because
+    apply_frame_layout() has already run for this frame and turned wrap on.
+
+    Returns the scale applied, or None when nothing was written.
+    """
+    try:
+        width_emu = int(box_width_emu)
+    except (TypeError, ValueError):
+        return None
+    box_pt = _usable_box_pt(text_frame, width_emu)
+    if box_pt <= 0:
+        return None
+
+    fallback = _fallback_font_pt(text_frame)
+    scale = 1.0
+    for para in text_frame.paragraphs:
+        text = ''.join(run.text for run in para.runs)
+        if not text.strip():
+            continue
+        sizes = [run.font.size.pt for run in para.runs if run.font.size]
+        size = max(sizes) if sizes else fallback
+        width = estimate_text_width(text, size)
+        if width > box_pt:
+            scale = min(scale, box_pt / width)
+    if scale >= 1.0:
+        return None
+    scale = max(scale, FIT_SHRINK_FLOOR)
+
+    shrunk = False
+    for para in text_frame.paragraphs:
+        for run in para.runs:
+            if run.font.size:
+                run.font.size = Pt(run.font.size.pt * scale)
+                shrunk = True
+    return scale if shrunk else None
+
+
+class CellBox:
+    """What apply_frame_layout() needs to know about one table cell.
+
+    The wrap gate measures against `shape.width`, and for a cell that width is
+    its column's — minus the cell's own margins — never the table's: a cell in
+    a 10-column table is about ten times narrower than the frame around it, and
+    the table's width would keep needs_wrap from ever firing on it. The cell
+    body's own insets come off inside frame_text_exceeds_box(), exactly as they
+    do for an ordinary text frame.
+    """
+
+    def __init__(self, table, row: int, col: int, shape=None):
+        cell = table.rows[row].cells[col]
+        self.width = (int(table.columns[col].width)
+                      - int(cell.margin_left or 0)
+                      - int(cell.margin_right or 0))
+        self.shape_id = f'{getattr(shape, "shape_id", "?")}[{row},{col}]'
 
 
 def check_text_fit(
@@ -487,6 +636,7 @@ def replace_text_in_shape(
     translated_runs: list[TranslatedRun],
     slide_idx: int,
     shape_idx: str,
+    clamp_to_slide: bool = True,
 ) -> list[TranslatedRun]:
     """
     Replace text in a shape with translated text.
@@ -503,6 +653,11 @@ def replace_text_in_shape(
                 translated_runs,
                 slide_idx,
                 f"{shape_idx}.{sub_idx}",
+                # A grouped child's left/width are in the group's child
+                # coordinate space, not slide EMUs: clamping them would not
+                # put the frame on the slide, so the off-slide fix (gap 1)
+                # applies to top-level frames only.
+                clamp_to_slide=False,
             )
             failed_runs.extend(runs)
         return failed_runs
@@ -516,7 +671,12 @@ def replace_text_in_shape(
         for translated_run in translated_runs:
             para_groups.setdefault(_paragraph_key(translated_run), []).append(translated_run)
         para_scales = {key: paragraph_font_scale(group) for key, group in para_groups.items()}
-        
+
+        # Cells that actually received text — only they get the layout fix, for
+        # the same reason apply_frame_layout() is gated on the frame path: a
+        # cell the injector could not write must stay as the source had it.
+        written_cells: dict[tuple[int, int], list[TranslatedRun]] = {}
+
         for translated_run in translated_runs:
             try:
                 run_parts = translated_run.run_id.split('_')
@@ -552,9 +712,22 @@ def replace_text_in_shape(
                 adjusted_size = resolve_font_size(translated_run, para_scale, orig_font_size)
                 if adjusted_size:
                     run.font.size = Pt(adjusted_size)
-                        
+
+                written_cells.setdefault((table_row, table_col), []).append(translated_run)
+
             except (IndexError, ValueError) as e:
                 failed_runs.append(translated_run)
+
+        # Same neutralisation as an ordinary frame (gap 2), measured on the
+        # CELL's box — its column minus the cell margins — instead of the
+        # table's: this branch returns before the frame path's
+        # apply_frame_layout(), so without this a real table keeps spAutoFit
+        # and wrap="none" and goes on growing over its neighbours.
+        for (table_row, table_col), cell_runs in written_cells.items():
+            cell = table.rows[table_row].cells[table_col]
+            apply_frame_layout(CellBox(table, table_row, table_col, shape),
+                               cell.text_frame, cell_runs)
+
         return failed_runs
     
     # Handle SmartArt diagrams
@@ -626,7 +799,14 @@ def replace_text_in_shape(
     # artifacts reworked — a frame the injector could not write must stay as the
     # source had it, and one that received nothing has nothing to re-fit.
     if len(translated_runs) > len(failed_runs):
+        # Order matters (gap 1): clamp first, so the wrap/autofit gates below
+        # measure the on-slide width; apply_frame_layout before the shrink, so a
+        # frame that needed wrap keeps it — the shrink only ever makes text
+        # narrower, never changes a gate the other way round.
+        clamped = clamp_frame_to_slide(shape) if clamp_to_slide else False
         apply_frame_layout(shape, text_frame, translated_runs)
+        if clamped:
+            shrink_frame_text_to_fit(text_frame, int(shape.width))
 
     return failed_runs
 

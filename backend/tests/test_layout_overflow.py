@@ -6,11 +6,15 @@ Standalone — no pytest required:
 
     cd backend && venv/bin/python tests/test_layout_overflow.py
 
-Why these four: the measured causes of the JP->EN deck overflow were (1) a font
+Why these exist: the measured causes of the JP->EN deck overflow were (1) a font
 scale that only ever ran for EN->JA, (2) every frame left on spAutoFit so the box
 grew over its neighbour, (3) wrap left off so the overflow ran off the slide
 edge, and (4) frames the translation did not disturb being fair game for a
-layout change nobody asked for.
+layout change nobody asked for. The two gaps left open by that fix are covered
+here as well: (5) frames whose box already sits past the slide's right edge are
+clamped back inside (and their text shrunk when clamping is not enough), and
+(6) real table cells — which return before apply_frame_layout() on the frame
+path — get the same neutralisation, measured on the cell's own width.
 """
 import sys
 from pathlib import Path
@@ -22,12 +26,14 @@ from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.util import Pt
 
 from app.core.injector import (
+    SLIDE_EDGE_MARGIN_EMU,
     calculate_font_scale,
     frame_text_exceeds_box,
     frame_text_grew,
     paragraph_font_scale,
     replace_text_in_shape,
     resolve_font_size,
+    CellBox,
 )
 from app.models import TranslatedRun
 
@@ -165,6 +171,124 @@ size = resolve_font_size(run_of('run_0_0_0_0_1', 'AI時代の経営',
                          jp_en, Pt(20))
 check('a growing JP->EN paragraph actually gets a smaller font size',
       size is not None and size < 20.0, f'{size}pt < 20.0pt')
+
+print('\n[5] an off-slide frame is pulled inside; an on-slide frame never moves')
+
+
+def offslide_frame(left_pt, width_pt, source_text, translated_text, font_pt=18.0):
+    """A PDF-import-style frame placed anywhere on a default 720x540pt slide,
+    injected with one run. Returns the presentation so the box can be measured."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Pt(left_pt), Pt(10), Pt(width_pt), Pt(60))
+    frame = box.text_frame
+    frame.word_wrap = False
+    frame.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
+    run = frame.paragraphs[0].add_run()
+    run.text = source_text
+    run.font.size = Pt(font_pt)
+    inject(box, [run_of('run_0_0_0_0_1', source_text, translated_text)])
+    return prs, box, frame
+
+
+# 'Data platform review' (20 latin chars at 18pt = 180pt of text) cannot fit
+# the ~98pt usable box the clamp leaves at left=600pt, and it does not grow
+# against the 30-char JP source, so the paragraph scale stays at 1.0 — any
+# shrink seen below came from the clamp, not from the scale.
+prs, box, frame = offslide_frame(600, 300, 'あ' * 30, 'Data platform review')
+check('the off-slide frame is clamped so its right edge lands on the limit',
+      box.left + box.width == prs.slide_width - SLIDE_EDGE_MARGIN_EMU,
+      f'right={(box.left + box.width) / 12700:.1f}pt '
+      f'limit={(prs.slide_width - SLIDE_EDGE_MARGIN_EMU) / 12700:.1f}pt')
+check('only width came off — the left edge did not move', box.left == Pt(600),
+      f'left={box.left / 12700:.1f}pt')
+clamped_run = frame.paragraphs[0].runs[0]
+check('clamping was not enough, so the frame text was shrunk instead of '
+      'running off',
+      clamped_run.font.size is not None and Pt(9) <= clamped_run.font.size < Pt(18),
+      f'size={clamped_run.font.size.pt if clamped_run.font.size else None}pt')
+check('after the shrink the text fits the clamped box',
+      not frame_text_exceeds_box(frame, box))
+
+# A frame already inside the slide must not move by a single EMU — including
+# one whose right edge sits inside the margin band but still on the slide.
+_, plain, _ = offslide_frame(100, 200, 'Governance framework', 'Governance')
+check('a plain on-slide frame keeps its exact EMU geometry',
+      plain.left == Pt(100) and plain.width == Pt(200),
+      f'left={plain.left} width={plain.width}')
+_, band, _ = offslide_frame(650, 68, 'Governance framework', 'Governance')
+check('a frame ending inside the margin band but on the slide keeps its EMU geometry',
+      band.left == Pt(650) and band.width == Pt(68),
+      f'left={band.left} width={band.width} right={(band.left + band.width) / 12700:.1f}pt')
+
+# Only when shrinking would leave a sliver does `left` move: here the left edge
+# itself is past the limit, so the frame slides back whole.
+prs, edge_box, _ = offslide_frame(715, 50, 'x', 'y')
+check('a frame whose left edge is past the limit slides back, keeping its width',
+      edge_box.left == prs.slide_width - SLIDE_EDGE_MARGIN_EMU - Pt(50)
+      and edge_box.width == Pt(50),
+      f'left={edge_box.left / 12700:.1f}pt width={edge_box.width / 12700:.1f}pt')
+
+
+print('\n[6] a real table cell gets the neutralisation, on its own box width')
+
+
+def real_table():
+    """A real .pptx table (slide.shapes.add_table), 10 columns wide, whose cells
+    carry the PDF-import artifacts: wrap off and spAutoFit on."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    grid = slide.shapes.add_table(2, 10, Pt(0), Pt(40), Pt(600), Pt(160))
+    for row in grid.table.rows:
+        for cell in row.cells:
+            cell.text_frame.word_wrap = False
+            cell.text_frame.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
+    victim = grid.table.rows[0].cells[0]
+    source_run = victim.text_frame.paragraphs[0].add_run()
+    source_run.text = 'グローバル戦略会議の枠組み'
+    source_run.font.size = Pt(18)
+    bystander = grid.table.rows[0].cells[1]
+    neighbour_run = bystander.text_frame.paragraphs[0].add_run()
+    neighbour_run.text = 'Anchor'
+    neighbour_run.font.size = Pt(18)
+    return grid, victim, bystander
+
+
+grid, victim, bystander = real_table()
+cell_box = CellBox(grid.table, 0, 0, grid)
+check('the box measured for the cell is its column, not the table',
+      cell_box.width < grid.width * 0.3,
+      f'cell={cell_box.width / 12700:.1f}pt vs table={grid.width / 12700:.1f}pt')
+
+# 28 latin chars at 18pt is ~252pt of text: far wider than this 10-column cell
+# (~31pt of usable box) and far narrower than the 600pt table, so a gate that
+# measured against the table's width would never fire on it — the gap.
+table_runs = [run_of('run_0_0.table.0.0_0_0_1', 'グローバル戦略会議の枠組み',
+                     'Data platform overview notes')]
+inject(grid, table_runs)
+
+check('the written cell is classified as exceeding its own box',
+      frame_text_exceeds_box(victim.text_frame, cell_box),
+      f'cell box={(cell_box.width / 12700) - 14.4:.1f}pt, '
+      f'text={28 * 18 * 0.5:.1f}pt')
+check('the same cell measured against the table would NOT exceed (the bug)',
+      not frame_text_exceeds_box(victim.text_frame, grid),
+      f'table box={(grid.width / 12700) - 14.4:.1f}pt')
+check('post-fix: the written cell is off spAutoFit (normAutofit)',
+      victim.text_frame.auto_size == MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE,
+      f'auto_size={victim.text_frame.auto_size}')
+check('post-fix: the written cell has wrap on',
+      victim.text_frame.word_wrap is True, f'word_wrap={victim.text_frame.word_wrap}')
+check('the translation landed in the cell',
+      victim.text_frame.paragraphs[0].runs[0].text == 'Data platform overview notes',
+      repr(victim.text_frame.paragraphs[0].runs[0].text))
+check('a cell that received nothing is left alone — autofit, wrap and text',
+      bystander.text_frame.auto_size == MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
+      and bystander.text_frame.word_wrap is False
+      and bystander.text_frame.paragraphs[0].runs[0].text == 'Anchor',
+      f'auto_size={bystander.text_frame.auto_size} '
+      f'word_wrap={bystander.text_frame.word_wrap} '
+      f'text={bystander.text_frame.paragraphs[0].runs[0].text!r}')
 
 print()
 if FAILURES:

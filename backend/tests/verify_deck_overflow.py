@@ -15,8 +15,14 @@ What it does:
        * frames with wrap off whose translated text grew,
        * frames with wrap off whose text no longer fits the box width,
        * text runs whose translated width exceeds the box width,
-  4. renders both decks with app/qa/render.py and keeps the PNGs of the heavy
-     slides (2, 6, 7, 20) under outputs/layout_overflow/ for inspection.
+       * the growing-frame trio the gap-1/gap-2 acceptance pins: frames whose
+         translated text is longer than its source (spaces ignored), and how
+         many of those are still on spAutoFit / still without wrap,
+       * text frames whose box sits past the slide's right edge (off-slide
+         boxes — clipped at the boundary whatever autofit/wrap does),
+  4. renders both decks with app/qa/render.py and keeps the PNGs under
+     outputs/layout_overflow/ for inspection (heavy slides 2, 6, 7, 20 plus
+     the off-slide slides 2, 11, 21 are all in there).
 """
 from __future__ import annotations
 
@@ -116,6 +122,11 @@ def measure(pptx_path: Path, groups: dict, label: str, text_key: str) -> dict:
         original = ''.join(r.original_text for r in runs)
         translated = ''.join(r.translated_text for r in runs)
         grew = estimate_visual_width(translated) > estimate_visual_width(original)
+        # The acceptance's "growing frame" count: translation longer than the
+        # source in characters, spaces ignored (the measure the 872 / 197 / 254
+        # trio was taken with, so before/after runs are comparable).
+        grew_chars = (len(translated.replace(' ', ''))
+                      > len(original.replace(' ', '')))
 
         box_pt = frame_box_pt(tf, shape)
         font_pt = frame_font_pt(tf)
@@ -134,6 +145,9 @@ def measure(pptx_path: Path, groups: dict, label: str, text_key: str) -> dict:
         m['wrap_off_grew'] += wrap_off and grew
         m['wrap_off_exceeds'] += wrap_off and exceeds
         m['wrap_on_exceeds'] += (not wrap_off) and exceeds
+        m['grew_chars'] += grew_chars
+        m['grew_chars_spAutoFit'] += grew_chars and spaf
+        m['grew_chars_wrap_off'] += grew_chars and wrap_off
         if grew:
             m['grew_fits'] += (not exceeds)
 
@@ -161,7 +175,8 @@ def measure(pptx_path: Path, groups: dict, label: str, text_key: str) -> dict:
     print(f'\n=== {label}: {pptx_path.name} ===')
     header = f'{"metric":40}{"total":>8}'
     print(header)
-    for key in ('frames', 'grew', 'spAutoFit', 'spAutoFit_grew', 'wrap_off',
+    for key in ('frames', 'grew', 'grew_chars', 'grew_chars_spAutoFit',
+                'grew_chars_wrap_off', 'spAutoFit', 'spAutoFit_grew', 'wrap_off',
                 'wrap_off_grew', 'exceeds_box', 'wrap_off_exceeds',
                 'wrap_on_exceeds', 'grew_fits', 'over_x110', 'over_x125',
                 'over_x150', 'runs', 'runs_over_box', 'runs_over_box_wrap_off'):
@@ -175,6 +190,51 @@ def measure(pptx_path: Path, groups: dict, label: str, text_key: str) -> dict:
         print(f'  slide {idx:>2}: {s["frames"]:>4} / {s["spAutoFit"]:>4} / '
               f'{s["wrap_off_grew"]:>4} / {s["wrap_off_exceeds"]:>4}')
     return dict(m)
+
+
+def offslide(pptx_path: Path, label: str) -> dict:
+    """Text frames whose box sits past the slide's right edge (gap 1).
+
+    A frame out there is clipped at the slide boundary whatever its wrap or
+    autofit does, so the box itself has to come back inside. Empty frames are
+    reported apart: this deck carries one full-bleed background frame about
+    120EMU (0.01pt) over the edge on every slide — no text to clip, so it is
+    not one of the 32.
+    """
+    prs = Presentation(str(pptx_path))
+    past: list[tuple[int, int]] = []
+    empty: list[tuple[int, int]] = []
+    for slide_idx, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            if not getattr(shape, 'has_text_frame', False):
+                continue
+            try:
+                spill_emu = int(shape.left) + int(shape.width) - int(prs.slide_width)
+            except (TypeError, ValueError):
+                continue
+            if spill_emu <= 0:
+                continue
+            text = ''.join(run.text for para in shape.text_frame.paragraphs
+                           for run in para.runs)
+            (past if text.strip() else empty).append((slide_idx, spill_emu))
+
+    per_slide: dict[int, int] = defaultdict(int)
+    for slide_idx, _ in past:
+        per_slide[slide_idx] += 1
+    worst = max((spill for _, spill in past), default=0) / 12700
+
+    print(f'\n=== off-slide boxes ({label}): {pptx_path.name} ===')
+    print(f'text frames past the slide right edge: {len(past)}   '
+          f'worst spill {worst:.1f}pt')
+    if past:
+        slides = ', '.join(f'{si + 1} ({n})' if n > 1 else f'{si + 1}'
+                           for si, n in sorted(per_slide.items()))
+        print(f'slides: {slides}')
+    if empty:
+        eworst = max(spill for _, spill in empty) / 12700
+        print(f'(plus {len(empty)} empty background frames over the edge, worst '
+              f'{eworst:.2f}pt — nothing to clip, left as the source has them)')
+    return {'past_right': len(past), 'worst_spill_pt': worst}
 
 
 def render_pair(source: Path, injected: Path) -> None:
@@ -213,13 +273,26 @@ def main() -> int:
 
     print('\n=== delta (injected - source) ===')
     for key in ('spAutoFit', 'wrap_off', 'wrap_off_grew', 'wrap_off_exceeds',
-                'exceeds_box', 'runs_over_box', 'runs_over_box_wrap_off'):
+                'exceeds_box', 'runs_over_box', 'runs_over_box_wrap_off',
+                'grew_chars_spAutoFit', 'grew_chars_wrap_off'):
         print(f'{key:30}{after[key] - before[key]:>+6}   {before[key]} -> {after[key]}')
+
+    src_off = offslide(source, 'source (intermediate)')
+    inj_off = offslide(injected, 'injected (translated)')
+    print(f'\noff-slide text frames: {src_off["past_right"]} (source) -> '
+          f'{inj_off["past_right"]} (injected), '
+          f'worst spill {src_off["worst_spill_pt"]:.1f}pt -> '
+          f'{inj_off["worst_spill_pt"]:.1f}pt')
 
     if '--render' in sys.argv:
         render_pair(source, injected)
     else:
         print('\n(skip rendering — pass --render to write PNGs)')
+
+    if inj_off['past_right']:
+        print(f'FAIL: {inj_off["past_right"]} off-slide text frames remain in '
+              f'the injected deck')
+        return 1
     return 0
 
 
