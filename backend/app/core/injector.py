@@ -3,6 +3,7 @@ Core PPTX re-injection logic.
 Re-inserts translated text while preserving original styling.
 """
 from pptx import Presentation
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.shapes.base import BaseShape as Shape
 from pptx.shapes.group import GroupShape
 from pptx.shapes.graphfrm import GraphicFrame
@@ -52,6 +53,11 @@ CHAR_WIDTH_RATIOS = {
     'en': 0.5,   # English characters (half-width)
 }
 
+# Used only when a frame carries no explicit run size anywhere, so the
+# wrap gate still has a size to measure with. check_text_fit() falls back
+# to the same value.
+DEFAULT_FONT_PT = 12.0
+
 
 def estimate_visual_width(text: str) -> float:
     """Estimate visual width of text. CJK chars are ~2.2x width of Latin chars in practice."""
@@ -94,14 +100,18 @@ def _paragraph_key(tr: TranslatedRun) -> str:
 
 
 def paragraph_font_scale(group: list[TranslatedRun]) -> float:
-    """One font scale for a whole paragraph.
+    """One font scale for a whole paragraph, computed for any target language.
 
     Scaling each run from its own fragment gives runs in the same paragraph
     different sizes, because every fragment has its own original:translated width
     ratio. The scale has to come from the paragraph's combined text.
+
+    This used to return 1.0 unless the target was Japanese, so JP->EN — the
+    direction that actually grows (an English translation of a Japanese line is
+    markedly longer) — got no length mitigation at all. The width model and its
+    tuned parameters (cjk_ratio 2.2, 5% tolerance, 0.5 floor) are unchanged;
+    only the gate is gone, so EN->JA output is byte-identical.
     """
-    if not any(tr.target_language == 'ja' for tr in group):
-        return 1.0
     ordered = sorted(group, key=_run_index)
     original = ''.join(tr.original_text for tr in ordered)
     translated = ''.join(tr.translated_text for tr in ordered)
@@ -136,6 +146,87 @@ def estimate_text_width(text: str, font_size: float) -> float:
     en_width = en_count * font_size * CHAR_WIDTH_RATIOS['en']
     
     return ja_width + en_width
+
+
+def frame_text_grew(runs: list[TranslatedRun]) -> bool:
+    """True when a frame's combined translated text is wider than its source.
+
+    Widths come from estimate_visual_width — the same model calculate_font_scale
+    scales against — so "grew" and "shrank the font" can never disagree about a
+    frame. Language-agnostic: it counts CJK and Latin at their real relative
+    widths, which is what makes it usable for every target language.
+    """
+    original = ''.join(tr.original_text for tr in runs)
+    translated = ''.join(tr.translated_text for tr in runs)
+    return estimate_visual_width(translated) > estimate_visual_width(original)
+
+
+def frame_text_exceeds_box(text_frame, shape) -> bool:
+    """True when any paragraph of the frame needs more than one line to fit.
+
+    This is the gate for word_wrap: a frame whose translation still fits its box
+    width keeps whatever wrap setting it arrived with, because turning wrap on
+    for a single-line label changes the layout for no reason.
+    """
+    try:
+        width_emu = int(shape.width)
+    except (TypeError, ValueError):
+        return False
+    margins = 0
+    for attr in ('margin_left', 'margin_right'):
+        try:
+            margins += int(getattr(text_frame, attr) or 0)
+        except Exception:
+            pass
+    box_pt = (width_emu - margins) / 12700
+    if box_pt <= 0:
+        return False
+
+    frame_sizes = [run.font.size.pt for para in text_frame.paragraphs
+                   for run in para.runs if run.font.size]
+    fallback = max(frame_sizes) if frame_sizes else DEFAULT_FONT_PT
+
+    for para in text_frame.paragraphs:
+        text = ''.join(run.text for run in para.runs)
+        if not text.strip():
+            continue
+        sizes = [run.font.size.pt for run in para.runs if run.font.size]
+        size = max(sizes) if sizes else fallback
+        if estimate_text_width(text, size) > box_pt:
+            return True
+    return False
+
+
+def apply_frame_layout(shape, text_frame, runs: list[TranslatedRun]) -> tuple[bool, bool]:
+    """Neutralise the PDF-import autofit/wrap artifacts on an injected frame.
+
+    LibreOffice's PDF import writes `spAutoFit` (SHAPE_TO_FIT_TEXT) and
+    `wrap="none"` on every text frame it creates. Once a translation outgrows the
+    source, `spAutoFit` grows the box over its neighbour — the "two sentences
+    printed on top of each other" defect — and wrap off sends the overflow
+    straight off the slide edge. Both are replaced, each behind its own gate so a
+    frame the translation did not disturb is left exactly as it was:
+
+      * text grew or no longer fits the box -> normAutofit (TEXT_TO_FIT_SHAPE),
+        the PowerPoint-native "shrink text to fit" answer. A frame that neither
+        grew nor overflowed cannot grow into anything, so it keeps its autofit.
+      * text no longer fits the box          -> word_wrap = True.
+
+    Returns (autofit_changed, wrap_changed).
+    """
+    autofit_changed = wrap_changed = False
+    try:
+        needs_wrap = frame_text_exceeds_box(text_frame, shape)
+        grows_box = text_frame.auto_size == MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
+        if grows_box and (frame_text_grew(runs) or needs_wrap):
+            text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            autofit_changed = True
+        if needs_wrap and text_frame.word_wrap is False:
+            text_frame.word_wrap = True
+            wrap_changed = True
+    except Exception as exc:
+        print(f"  [INJECTOR] frame layout fix failed (shape {getattr(shape, 'shape_id', '?')}): {exc}")
+    return autofit_changed, wrap_changed
 
 
 def check_text_fit(
@@ -531,6 +622,12 @@ def replace_text_in_shape(
         except (IndexError, ValueError) as e:
             failed_runs.extend(runs)
     
+    # Only frames that actually received text get their PDF-import layout
+    # artifacts reworked — a frame the injector could not write must stay as the
+    # source had it, and one that received nothing has nothing to re-fit.
+    if len(translated_runs) > len(failed_runs):
+        apply_frame_layout(shape, text_frame, translated_runs)
+
     return failed_runs
 
 
