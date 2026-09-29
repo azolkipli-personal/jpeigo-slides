@@ -3,10 +3,17 @@
  * Forwards to Python FastAPI backend.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { beginExport } from '@/lib/exportGate';
 
 const PYTHON_BACKEND_URL = process.env.PYTHON_BACKEND_URL || 'http://localhost:8002';
 
 export async function POST(request: NextRequest) {
+  // Hold the export gate for the whole download. The preview route waits on
+  // this gate before it asks the backend to build a deck, so a download that
+  // starts first runs alone; this side never waits on a preview, so a preview
+  // in flight cannot delay the user. Released in `finally` — a failed export
+  // must not leave previews waiting forever.
+  const releaseExport = beginExport();
   try {
     const body = await request.json();
     const { job_id, filename } = body;
@@ -95,5 +102,7 @@ export async function POST(request: NextRequest) {
       { error: 'Failed to export file' },
       { status: 500 }
     );
+  } finally {
+    releaseExport();
   }
 }

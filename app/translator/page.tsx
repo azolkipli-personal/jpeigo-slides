@@ -4,6 +4,7 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import SlidesPanel from '@/components/SlidesPanel';
 import ThemeToggle from '@/components/ThemeToggle';
 import { APP_VERSION } from '@/lib/version';
+import { PreviewRequestError, fetchPreviewIndex } from '@/lib/previewIndex';
 
 // --- Types ---
 interface TextRun { run_id: string; text: string; style: { font_size: number | null; font_color: string | null; font_name: string | null; bold: boolean; italic: boolean; underline: boolean; }; merged_span?: [number, number] | null; }
@@ -345,16 +346,17 @@ export default function NewTranslatorPage() {
     setPreviewError(null);
     setCurrentSlide(0);
     try {
-      const res = await fetch('/api/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: jobId, filename, which }),
-      });
-      if (!res.ok) throw new Error(text.previewError);
-      const data = await res.json();
-      setPreviewImages(data.images || []);
-    } catch {
-      setPreviewError(text.previewError);
+      // One URL per slide: the route answers 202 while the deck renders in the
+      // background and 200 with the index when it is cached, so no request here
+      // stays open for the length of a conversion and the viewer fetches images
+      // as it pages. fetchPreviewIndex owns the polling and the error text.
+      setPreviewImages(await fetchPreviewIndex(jobId, filename, which));
+    } catch (err) {
+      // A failure the server explained (conversion timeout, backend non-2xx)
+      // is worth showing verbatim; anything else keeps the translated message.
+      setPreviewError(err instanceof PreviewRequestError && err.serverMessage
+        ? err.serverMessage
+        : text.previewError);
     } finally {
       setPreviewLoading(false);
     }

@@ -1,173 +1,180 @@
 /**
- * API route for generating slide preview images from a PPTX.
- * Converts PPTX → PDF → individual page PNGs using LibreOffice + pdftoppm.
- * Results are cached per deck (job_id + which) so repeated requests skip the heavy
- * conversion. Pass which: 'original' to render the deck as uploaded, 'translated'
- * (default) to render the exported deck — that pair is the before/after view.
+ * Slide preview — index endpoint.
+ *
+ * POST answers with an *index* of the deck: how many slides there are and a URL
+ * per slide (`/api/preview/slide?…&n=k`, served by the sibling route). It never
+ * returns image bytes, so a 26-slide deck is a ~2 kB reply instead of the 12 MB
+ * base64 blob this route used to build, and each request does a bounded amount
+ * of work.
+ *
+ * Generation itself (fetch deck → LibreOffice → pdftoppm) runs in the
+ * background and answers 202 `pending: true` until the cache is populated, so
+ * no request is ever held open for the length of a conversion — and, crucially,
+ * the conversions are spawned asynchronously instead of `execSync`-ed, so the
+ * server's event loop keeps serving the rest of the app (the Download button
+ * included) while a preview renders.
+ *
+ * Cache keys are unchanged: `<job_id>` for the translated deck, `<job_id>--original`
+ * for the deck as uploaded, one directory of PNGs each.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { execSync } from 'child_process';
-import {
-  mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync,
-} from 'fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { whenExportsIdle } from '@/lib/exportGate';
+import { runCommand } from '@/lib/runCommand';
+import {
+  type DeckKind, cachedSlideCount, cacheKeyFor, claimGeneration, clearGeneration,
+  failGeneration, getGeneration, isSafeJobId, parseDeckKind, saveToCache,
+  sortSlideFiles, sweepCache, withRenderLock,
+} from '@/lib/previewStore';
 
 const PYTHON_BACKEND_URL = process.env.PYTHON_BACKEND_URL || 'http://localhost:8002';
-const CACHE_DIR = '/tmp/pptx-preview-cache';
-const CACHE_TTL_MS = 3600_000; // 1 hour
 
-/** Quick stat for TTL check — no extra deps needed. */
-function mtimeMs(p: string): number {
-  try {
-    const { statSync } = require('fs') as typeof import('fs');
-    return statSync(p).mtimeMs;
-  } catch { return 0; }
+const SOFFICE_TIMEOUT_MS = 60_000;
+const PDFTOPPM_TIMEOUT_MS = 60_000;
+const DECK_FETCH_TIMEOUT_MS = 60_000;
+
+function pendingResponse(kind: DeckKind): NextResponse {
+  return NextResponse.json({ pending: true, total: 0, which: kind }, { status: 202 });
 }
 
-/** Sweep cache entries older than TTL (fire-and-forget). */
-function sweepCache(): void {
-  try {
-    const dir = readdirSync(CACHE_DIR, { withFileTypes: true });
-    const now = Date.now();
-    for (const entry of dir) {
-      if (entry.isDirectory()) {
-        const full = join(CACHE_DIR, entry.name);
-        if (now - mtimeMs(full) > CACHE_TTL_MS) {
-          rmSync(full, { recursive: true, force: true });
-        }
-      }
-    }
-  } catch { /* first call or race — ignore */ }
+function indexResponse(jobId: string, kind: DeckKind, total: number, cached: boolean): NextResponse {
+  const images = Array.from({ length: total }, (_, i) =>
+    `/api/preview/slide?job_id=${encodeURIComponent(jobId)}&which=${kind}&n=${i + 1}`);
+  return NextResponse.json({ images, total, cached, which: kind });
 }
 
-function loadCachedImages(cacheKey: string): string[] | null {
-  const cacheDir = join(CACHE_DIR, cacheKey);
-  if (!existsSync(cacheDir)) return null;
+/**
+ * Pull the deck from the backend. The translated side is built on demand by
+ * POST /api/export; the original side is the upload as it arrived, which is
+ * what makes the before/after pair comparable.
+ */
+async function fetchDeck(jobId: string, filename: string, kind: DeckKind): Promise<Buffer> {
+  const deckRes = kind === 'original'
+    ? await fetch(
+        `${PYTHON_BACKEND_URL}/api/source?job_id=${encodeURIComponent(jobId)}`,
+        { signal: AbortSignal.timeout(DECK_FETCH_TIMEOUT_MS) },
+      )
+    : await fetch(`${PYTHON_BACKEND_URL}/api/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, filename: filename || `translated_${jobId}.pptx` }),
+        signal: AbortSignal.timeout(DECK_FETCH_TIMEOUT_MS),
+      });
+  if (!deckRes.ok) {
+    throw new Error(`Failed to fetch the ${kind} PPTX from the backend (HTTP ${deckRes.status})`);
+  }
+  return Buffer.from(await deckRes.arrayBuffer());
+}
 
-  const files = readdirSync(cacheDir)
-    .filter((f) => f.endsWith('.png'))
-    .sort((a, b) => {
-      const nA = parseInt(a.match(/slide-(\d+)\.png$/)?.[1] || '0');
-      const nB = parseInt(b.match(/slide-(\d+)\.png$/)?.[1] || '0');
-      return nA - nB;
+/** PPTX → PDF → PNGs. Both converters are spawned, so the event loop keeps serving. */
+async function renderSlides(pptxBuffer: Buffer, workDir: string): Promise<string[]> {
+  mkdirSync(workDir, { recursive: true });
+  const pptxPath = join(workDir, 'slides.pptx');
+  writeFileSync(pptxPath, pptxBuffer);
+
+  await runCommand(
+    'soffice',
+    ['--headless', '--convert-to', 'pdf', '--outdir', workDir, pptxPath],
+    SOFFICE_TIMEOUT_MS,
+    'LibreOffice conversion (PPTX → PDF)',
+  );
+
+  const pdfPath = join(workDir, 'slides.pdf');
+  if (!existsSync(pdfPath)) {
+    throw new Error('LibreOffice conversion (PPTX → PDF) produced no PDF');
+  }
+
+  await runCommand(
+    'pdftoppm',
+    ['-png', '-r', '150', pdfPath, join(workDir, 'slide')],
+    PDFTOPPM_TIMEOUT_MS,
+    'PDF rendering (pdftoppm)',
+  );
+
+  const files = sortSlideFiles(readdirSync(workDir).filter((f) => /^slide-\d+\.png$/.test(f)));
+  if (files.length === 0) {
+    throw new Error('PDF rendering (pdftoppm) produced no slide images');
+  }
+  return files;
+}
+
+/**
+ * Render one deck into the cache. Runs detached from the request that started
+ * it: the client polls until the cache exists, so the work survives the reply
+ * and no connection stays open for the duration.
+ */
+async function generatePreview(jobId: string, filename: string, kind: DeckKind, cacheKey: string): Promise<void> {
+  const workDir = join('/tmp', `pptx-preview-${randomUUID()}`);
+  try {
+    await withRenderLock(async () => {
+      // Someone else may have finished this key while we queued.
+      if (cachedSlideCount(cacheKey) > 0) return;
+
+      // A download in flight has priority: the preview must not ask the backend
+      // to build a deck while a user's export is running. Downloads never wait
+      // on previews (see lib/exportGate.ts for why the gate is one-way).
+      await whenExportsIdle();
+
+      const pptxBuffer = await fetchDeck(jobId, filename, kind);
+      const files = await renderSlides(pptxBuffer, workDir);
+
+      // Publish atomically (staged rename) and clean up after ourselves.
+      saveToCache(cacheKey, workDir, files);
     });
-
-  if (files.length === 0) return null;
-
-  return files.map((f) => {
-    const data = readFileSync(join(cacheDir, f));
-    return `data:image/png;base64,${data.toString('base64')}`;
-  });
-}
-
-function saveToCache(cacheKey: string, sourceDir: string, fileNames: string[]): void {
-  try {
-    const cacheDir = join(CACHE_DIR, cacheKey);
-    mkdirSync(cacheDir, { recursive: true });
-    for (const f of fileNames) {
-      const src = join(sourceDir, f);
-      if (existsSync(src)) {
-        writeFileSync(join(cacheDir, f), readFileSync(src));
-      }
-    }
-    // Update mtime on the dir so TTL sweep works
-    const now = new Date();
-    const { utimesSync } = require('fs') as typeof import('fs');
-    try { utimesSync(cacheDir, now, now); } catch { /* ok */ }
-  } catch {
-    // Non-fatal — next request will regenerate
+    clearGeneration(cacheKey);
+    sweepCache();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    console.error('Preview generation error:', message);
+    failGeneration(cacheKey, message);
+  } finally {
+    try { rmSync(workDir, { recursive: true, force: true }); } catch { /* ok */ }
   }
 }
 
 export async function POST(request: NextRequest) {
-  const workDir = join('/tmp', `pptx-preview-${randomUUID()}`);
-
+  let body: { job_id?: unknown; filename?: unknown; which?: unknown };
   try {
-    const { job_id, filename, which } = await request.json();
-    if (!job_id) {
-      return NextResponse.json({ error: 'job_id is required' }, { status: 400 });
-    }
-    // 'translated' (default) renders the exported deck, 'original' the deck as uploaded;
-    // the two are cached separately so switching back and forth is instant.
-    const deckKind: 'original' | 'translated' = which === 'original' ? 'original' : 'translated';
-    const cacheKey = deckKind === 'original' ? `${job_id}--original` : job_id;
-
-    // --- Check cache first ---
-    const cached = loadCachedImages(cacheKey);
-    if (cached) {
-      return NextResponse.json({ images: cached, total: cached.length, cached: true, which: deckKind });
-    }
-
-    // --- Generate fresh ---
-    // 1. Download the deck from the Python backend. The translated side is built on
-    //    demand by POST /api/export; the original side is the upload returned as-is,
-    //    which is the whole reason both can be shown side by side.
-    const deckRes = deckKind === 'original'
-      ? await fetch(`${PYTHON_BACKEND_URL}/api/source?job_id=${encodeURIComponent(job_id)}`)
-      : await fetch(`${PYTHON_BACKEND_URL}/api/export`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ job_id, filename: filename || `translated_${job_id}.pptx` }),
-        });
-    if (!deckRes.ok) {
-      return NextResponse.json(
-        { error: `Failed to fetch the ${deckKind} PPTX` }, { status: 500 },
-      );
-    }
-    const pptxBuffer = Buffer.from(await deckRes.arrayBuffer());
-
-    // 2. Save to work dir
-    mkdirSync(workDir, { recursive: true });
-    const pptxPath = join(workDir, 'slides.pptx');
-    writeFileSync(pptxPath, pptxBuffer);
-
-    // 3. Convert PPTX → PDF using LibreOffice
-    execSync(
-      `soffice --headless --convert-to pdf --outdir "${workDir}" "${pptxPath}"`,
-      { timeout: 60_000, stdio: 'pipe' },
-    );
-
-    const pdfPath = join(workDir, 'slides.pdf');
-
-    // 4. Convert PDF → individual PNGs using pdftoppm
-    execSync(
-      `pdftoppm -png -r 150 "${pdfPath}" "${workDir}/slide"`,
-      { timeout: 60_000, stdio: 'pipe' },
-    );
-
-    // 5. Read back the generated PNG files
-    const files = readdirSync(workDir)
-      .filter((f: string) => f.startsWith('slide-') && f.endsWith('.png'))
-      .sort((a: string, b: string) => {
-        const numA = parseInt(a.match(/slide-(\d+)\.png$/)?.[1] || '0');
-        const numB = parseInt(b.match(/slide-(\d+)\.png$/)?.[1] || '0');
-        return numA - numB;
-      });
-
-    const images = files.map((f: string) => {
-      const data = readFileSync(join(workDir, f));
-      return `data:image/png;base64,${data.toString('base64')}`;
-    });
-
-    // 6. Cache the generated PNGs for next time
-    saveToCache(cacheKey, workDir, files);
-
-    // 7. Cleanup work dir + sweep old cache entries
-    rmSync(workDir, { recursive: true, force: true });
-    sweepCache();
-
-    return NextResponse.json({ images, total: images.length, cached: false, which: deckKind });
-
-  } catch (error) {
-    try { rmSync(workDir, { recursive: true, force: true }); } catch { /* ok */ }
-    console.error('Preview generation error:', error);
-    return NextResponse.json(
-      {
-        error: 'Failed to generate preview images: ' +
-          (error instanceof Error ? error.message : 'Unknown error'),
-      },
-      { status: 500 },
-    );
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
+
+  const { job_id, filename, which } = body;
+  if (job_id === undefined || job_id === null || job_id === '') {
+    return NextResponse.json({ error: 'job_id is required' }, { status: 400 });
+  }
+  if (!isSafeJobId(job_id)) {
+    return NextResponse.json({ error: 'job_id is not a valid job identifier' }, { status: 400 });
+  }
+
+  const kind = parseDeckKind(which);
+  const cacheKey = cacheKeyFor(job_id, kind);
+
+  // Ready: the index (slide count + per-slide URLs) and nothing heavier.
+  const total = cachedSlideCount(cacheKey);
+  if (total > 0) {
+    return indexResponse(job_id, kind, total, true);
+  }
+
+  const state = getGeneration(cacheKey);
+  if (state?.status === 'error') {
+    // Surface the real failure (timeout, non-2xx backend, no output) once, then
+    // release the key so the next request can try again.
+    clearGeneration(cacheKey);
+    return NextResponse.json({ error: state.message }, { status: 500 });
+  }
+  if (state?.status === 'running') {
+    return pendingResponse(kind);
+  }
+
+  // Claim before awaiting anything: check-and-set in a single tick, so two
+  // concurrent POSTs for the same deck cannot both start a conversion.
+  if (!claimGeneration(cacheKey)) {
+    return pendingResponse(kind);
+  }
+  void generatePreview(job_id, typeof filename === 'string' ? filename : '', kind, cacheKey);
+  return pendingResponse(kind);
 }
